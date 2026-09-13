@@ -10,9 +10,7 @@ import (
 	"unsafe"
 )
 
-// isTerminal probes terminal attributes without consuming stream data
-// BSD-family systems expose terminal attributes through TIOCGETA
-// a successful ioctl distinguishes a real terminal from other character devices
+// TIOCGETA distinguishes terminals from other character devices without consuming input
 func isTerminal(file *os.File) bool {
 	var attributes syscall.Termios
 	_, _, errno := syscall.Syscall6(

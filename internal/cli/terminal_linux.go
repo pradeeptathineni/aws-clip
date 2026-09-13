@@ -10,9 +10,7 @@ import (
 	"unsafe"
 )
 
-// isTerminal asks the kernel for terminal attributes without consuming input
-// filesystem metadata alone cannot distinguish terminals from /dev/null
-// non-terminal character devices reject TCGETS and fail closed
+// TCGETS distinguishes terminals from other character devices without consuming input
 func isTerminal(file *os.File) bool {
 	var attributes syscall.Termios
 	_, _, errno := syscall.Syscall6(

@@ -12,8 +12,6 @@ import (
 	"testing"
 )
 
-// TestProfilesExposeSafeConfigurationMetadata fixes the versioned discovery contract
-// credential and session configuration must remain absent from machine output
 func TestProfilesExposeSafeConfigurationMetadata(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	configPath := writeConfig(t, `{"profile":"prod","protected_profiles":{"prod":"210987654321"}}`)
@@ -57,8 +55,6 @@ func TestProfilesExposeSafeConfigurationMetadata(t *testing.T) {
 	}
 }
 
-// TestLoginUsesSourceProfileAuthenticationAndVerifiesIdentity covers role-chain ownership
-// selected role identity must be rechecked after authenticating its source profile
 func TestLoginUsesSourceProfileAuthenticationAndVerifiesIdentity(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
@@ -101,7 +97,6 @@ func TestLoginUsesSourceProfileAuthenticationAndVerifiesIdentity(t *testing.T) {
 	}
 }
 
-// TestLoginBootstrapsAndLogsOutLocalSession covers profile-scoped local lifecycle calls
 func TestLoginBootstrapsAndLogsOutLocalSession(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 
@@ -139,7 +134,6 @@ func TestLoginBootstrapsAndLogsOutLocalSession(t *testing.T) {
 	})
 }
 
-// TestSSOLogoutRequiresGlobalEffectAcknowledgement protects the account-wide cache effect
 func TestSSOLogoutRequiresGlobalEffectAcknowledgement(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	profileConfig := `{"operations":{"sso_session":"company"}}`
@@ -175,7 +169,6 @@ func TestSSOLogoutRequiresGlobalEffectAcknowledgement(t *testing.T) {
 	})
 }
 
-// TestContextVerifiesProtectedAccountAndReturnsStableJSON binds local policy to STS facts
 func TestContextVerifiesProtectedAccountAndReturnsStableJSON(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	configPath := writeConfig(t, `{"profile":"prod","protected_profiles":{"prod":"123456789012"}}`)
@@ -197,8 +190,6 @@ func TestContextVerifiesProtectedAccountAndReturnsStableJSON(t *testing.T) {
 	}
 }
 
-// TestExecRequiresIdentityBoundApprovalForDestructiveOperations checks preview-before-action
-// only the exact account observed during preflight can unlock the service operation
 func TestExecRequiresIdentityBoundApprovalForDestructiveOperations(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	command := []string{"ec2", "terminate-instances", "--instance-ids", "i-example"}
@@ -232,7 +223,6 @@ func TestExecRequiresIdentityBoundApprovalForDestructiveOperations(t *testing.T)
 	})
 }
 
-// TestExecBlocksProfileOverridesAndCredentialEnvironment preserves verified context isolation
 func TestExecBlocksProfileOverridesAndCredentialEnvironment(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 
@@ -274,7 +264,6 @@ func TestExecBlocksProfileOverridesAndCredentialEnvironment(t *testing.T) {
 	})
 }
 
-// TestProtectedProfileRejectsAccountMismatch fails before any requested service operation
 func TestProtectedProfileRejectsAccountMismatch(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	configPath := writeConfig(t, `{"profile":"prod","protected_profiles":{"prod":"210987654321"}}`)
@@ -290,7 +279,6 @@ func TestProtectedProfileRejectsAccountMismatch(t *testing.T) {
 	}
 }
 
-// TestProtectedProfileRequiresAccountApprovalForChanges covers all non-read profile changes
 func TestProtectedProfileRequiresAccountApprovalForChanges(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	configPath := writeConfig(t, `{"profile":"prod","protected_profiles":{"prod":"123456789012"}}`)
@@ -308,7 +296,6 @@ func TestProtectedProfileRequiresAccountApprovalForChanges(t *testing.T) {
 	}
 }
 
-// TestPotentiallyCostlyOperationsRequireAccountApproval covers generic and S3 guard rules
 func TestPotentiallyCostlyOperationsRequireAccountApproval(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	tests := []struct {
@@ -338,7 +325,6 @@ func TestPotentiallyCostlyOperationsRequireAccountApproval(t *testing.T) {
 	}
 }
 
-// TestProtectedProfileConfigurationIsValidated rejects ambiguous account guard definitions
 func TestProtectedProfileConfigurationIsValidated(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -359,7 +345,6 @@ func TestProtectedProfileConfigurationIsValidated(t *testing.T) {
 	}
 }
 
-// containsCall compares complete literal argv records within a subprocess trace
 func containsCall(calls [][]string, wanted []string) bool {
 	for _, call := range calls {
 		if reflect.DeepEqual(call, wanted) {

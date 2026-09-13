@@ -11,18 +11,12 @@ import (
 	"os/signal"
 )
 
-// runAWS starts exactly one previously validated AWS CLI process
-// arguments remain literal with no intermediate shell interpretation
-// environ replaces the child environment and streams preserve binary data
-// nil output streams use the operating-system null device for secret-safe probes
-// returns the native child status or exitCannotRun for wrapper process failures
+// Arguments stay literal, streams preserve binary data, and nil output goes to
+// the null device for secret-safe probes; wrapper failures return exitCannotRun
 func runAWS(path string, arguments, environ []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	command := exec.Command(path, arguments...)
 	command.Env = environ
 	command.Stdin = stdin
-	// A nil os/exec stream is connected directly to the null device
-	// checks use that path so configured credential values never pass through
-	// aws-clip memory
 	if stdout != nil {
 		command.Stdout = stdout
 	}
@@ -45,8 +39,7 @@ func runAWS(path string, arguments, environ []string, stdin io.Reader, stdout, s
 		for {
 			select {
 			case received := <-forwarded:
-				// Signal errors usually mean the child has already exited
-				// Wait owns the authoritative status so there is nothing useful to report
+				// Wait owns the authoritative status if the child has already exited
 				_ = command.Process.Signal(received)
 			case <-stopped:
 				return

@@ -6,9 +6,7 @@ package cli
 
 import "os"
 
-// isTerminal fails closed on platforms without an implemented console probe
-// Disabling interactive AWS features is safer than allowing a pager or prompt
-// to block automation based only on ambiguous character-device metadata
+// Fail closed rather than let a pager or prompt block automation
 func isTerminal(_ *os.File) bool {
 	return false
 }

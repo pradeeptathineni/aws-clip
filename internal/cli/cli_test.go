@@ -20,10 +20,7 @@ import (
 	"time"
 )
 
-// TestMain also serves as a hermetic AWS CLI v2 and wrapper process
-// Filesystem aliases exercise real argv,
-// streams, environment, signals, and exit statuses without requiring AWS or
-// making a network request
+// TestMain dispatches hermetic subprocesses so tests exercise real process boundaries.
 func TestMain(m *testing.M) {
 	name := strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
 	switch name {
@@ -36,20 +33,18 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-// observedEnvironment distinguishes an unset variable from an explicitly empty one
+// Set distinguishes an unset variable from an explicitly empty value
 type observedEnvironment struct {
 	Set   bool   `json:"set"`
 	Value string `json:"value,omitempty"`
 }
 
-// observation captures the child process boundary for literal forwarding assertions
 type observation struct {
 	Arguments   []string                       `json:"arguments"`
 	Environment map[string]observedEnvironment `json:"environment"`
 }
 
-// fakeAWS implements the narrow AWS CLI behaviors needed by integration-style tests
-// environment controls keep each subprocess deterministic and free of network access
+// Environment controls keep the fake deterministic and offline
 func fakeAWS() {
 	arguments := os.Args[1:]
 	appendCallLog(arguments)
@@ -159,12 +154,10 @@ func fakeAWS() {
 	}
 }
 
-// isFakeConfigureCommand recognizes an exact two-token configure request
 func isFakeConfigureCommand(arguments []string, operation string) bool {
 	return len(arguments) == 2 && arguments[0] == "configure" && arguments[1] == operation
 }
 
-// fakeConfigureGet extracts key and profile from the one supported metadata shape
 func fakeConfigureGet(arguments []string) (key, profile string, ok bool) {
 	if len(arguments) != 5 || arguments[0] != "configure" || arguments[1] != "get" || arguments[3] != "--profile" {
 		return "", "", false
@@ -172,7 +165,6 @@ func fakeConfigureGet(arguments []string) (key, profile string, ok bool) {
 	return arguments[2], arguments[4], true
 }
 
-// isFakeIdentityRequest recognizes bounded internal STS probes despite timeout prefixes
 func isFakeIdentityRequest(arguments []string) bool {
 	for index := 0; index+1 < len(arguments); index++ {
 		if arguments[index] == "sts" && arguments[index+1] == "get-caller-identity" {
@@ -182,7 +174,6 @@ func isFakeIdentityRequest(arguments []string) bool {
 	return false
 }
 
-// fakeIdentityArguments returns the exact secret-minimizing STS query contract
 func fakeIdentityArguments() []string {
 	return []string{
 		"sts", "get-caller-identity",
@@ -191,13 +182,11 @@ func fakeIdentityArguments() []string {
 	}
 }
 
-// fakeProfileRegionArguments returns the expected AWS-owned Region lookup
 func fakeProfileRegionArguments(profile string) []string {
 	return []string{"configure", "get", "region", "--profile", profile}
 }
 
-// appendCallLog records one argv array per line when a test requests call tracing
-// mode 0600 prevents fixture arguments from becoming broadly readable
+// Call traces may contain sensitive arguments, so fixtures remain owner-readable
 func appendCallLog(arguments []string) {
 	path := os.Getenv("FAKE_CALL_LOG")
 	if path == "" {
@@ -215,8 +204,6 @@ func appendCallLog(arguments []string) {
 	_, _ = file.Write(append(data, '\n'))
 }
 
-// TestExecPassesArgumentsLiterallyAndReturnsAWSStatus protects the no-shell boundary
-// also verifies native output, diagnostics, call order, and nonzero AWS status
 func TestExecPassesArgumentsLiterallyAndReturnsAWSStatus(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	observationPath := filepath.Join(t.TempDir(), "observation.json")
@@ -258,7 +245,6 @@ func TestExecPassesArgumentsLiterallyAndReturnsAWSStatus(t *testing.T) {
 	}
 }
 
-// TestExecPreservesBinaryStdinStdoutAndStderr covers byte-transparent process streams
 func TestExecPreservesBinaryStdinStdoutAndStderr(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	input := []byte{0x00, 'i', 'n', '\n', 0xff}
@@ -277,7 +263,6 @@ func TestExecPreservesBinaryStdinStdoutAndStderr(t *testing.T) {
 	}
 }
 
-// TestNonTTYDisablesPagerAndAutoPromptWithoutAddingOutput protects automation from blocking
 func TestNonTTYDisablesPagerAndAutoPromptWithoutAddingOutput(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	observationPath := filepath.Join(t.TempDir(), "observation.json")
@@ -300,7 +285,6 @@ func TestNonTTYDisablesPagerAndAutoPromptWithoutAddingOutput(t *testing.T) {
 	assertEnvironment(t, observed, "AWS_CLI_AUTO_PROMPT", true, "off")
 }
 
-// TestProcessWithNullStreamsDisablesPagerAndAutoPrompt exercises real null-device detection
 func TestProcessWithNullStreamsDisablesPagerAndAutoPrompt(t *testing.T) {
 	wrapper := makeProcessAlias(t, "fake-wrapper")
 	fake := makeProcessAlias(t, "fake-aws")
@@ -336,7 +320,6 @@ func TestProcessWithNullStreamsDisablesPagerAndAutoPrompt(t *testing.T) {
 	assertEnvironment(t, observed, "AWS_CLI_AUTO_PROMPT", true, "off")
 }
 
-// TestTTYLeavesPagerAndAutoPromptUntouched preserves operator-selected interactive behavior
 func TestTTYLeavesPagerAndAutoPromptUntouched(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	observationPath := filepath.Join(t.TempDir(), "observation.json")
@@ -355,8 +338,6 @@ func TestTTYLeavesPagerAndAutoPromptUntouched(t *testing.T) {
 	assertEnvironment(t, observed, "AWS_CLI_AUTO_PROMPT", true, "on")
 }
 
-// TestConfigurationPrecedenceAndAWSDeferral fixes the file-environment-flag ordering
-// unset AWS controls must remain absent so the installed CLI owns its defaults
 func TestConfigurationPrecedenceAndAWSDeferral(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	tests := []struct {
@@ -482,7 +463,6 @@ func TestConfigurationPrecedenceAndAWSDeferral(t *testing.T) {
 	})
 }
 
-// TestDoctorReportsCredentialEnvironmentWithoutExposingValues enforces name-only diagnosis
 func TestDoctorReportsCredentialEnvironmentWithoutExposingValues(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
@@ -512,7 +492,6 @@ func TestDoctorReportsCredentialEnvironmentWithoutExposingValues(t *testing.T) {
 	}
 }
 
-// TestConfiguredControlCharactersCannotInjectDiagnostics protects line record boundaries
 func TestConfiguredControlCharactersCannotInjectDiagnostics(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	tests := []struct {
@@ -560,7 +539,6 @@ func TestConfiguredControlCharactersCannotInjectDiagnostics(t *testing.T) {
 	}
 }
 
-// TestDoctorEscapesUnsafeOSDerivedValues covers paths outside configuration validation
 func TestDoctorEscapesUnsafeOSDerivedValues(t *testing.T) {
 	var output bytes.Buffer
 	writeDoctor(&output, awsInfo{
@@ -580,7 +558,6 @@ func TestDoctorEscapesUnsafeOSDerivedValues(t *testing.T) {
 	}
 }
 
-// TestMissingAndV1AWSAreRejectedBeforeExecution requires verified AWS CLI v2 provenance
 func TestMissingAndV1AWSAreRejectedBeforeExecution(t *testing.T) {
 	t.Run("missing binary", func(t *testing.T) {
 		rt, stdout, stderr := testRuntime(t, false, nil)
@@ -624,7 +601,6 @@ func TestMissingAndV1AWSAreRejectedBeforeExecution(t *testing.T) {
 	})
 }
 
-// TestExecForwardsInterruptAndReportsSignalStatus protects shell-compatible cancellation
 func TestExecForwardsInterruptAndReportsSignalStatus(t *testing.T) {
 	if gostdruntime.GOOS == "windows" {
 		t.Skip("Windows interrupt delivery does not use POSIX exit status 130")
@@ -683,7 +659,6 @@ func TestExecForwardsInterruptAndReportsSignalStatus(t *testing.T) {
 	}
 }
 
-// TestExecRequiresExplicitSeparator keeps wrapper options distinct from AWS arguments
 func TestExecRequiresExplicitSeparator(t *testing.T) {
 	rt, stdout, stderr := testRuntime(t, false, nil)
 	status := run([]string{"exec", "sts", "get-caller-identity"}, rt)
@@ -692,7 +667,6 @@ func TestExecRequiresExplicitSeparator(t *testing.T) {
 	}
 }
 
-// testRuntime builds isolated streams, configuration, and environment for one test
 func testRuntime(t *testing.T, interactive bool, stdin io.Reader, additionalEnvironment ...string) (runtime, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	if stdin == nil {
@@ -714,7 +688,6 @@ func testRuntime(t *testing.T, interactive bool, stdin io.Reader, additionalEnvi
 	}, stdout, stderr
 }
 
-// baseEnvironment retains only variables needed to launch portable child processes
 func baseEnvironment() []string {
 	// Omit host AWS settings so unset-value tests stay machine-independent
 	environment := []string{"PATH=" + os.Getenv("PATH")}
@@ -726,8 +699,7 @@ func baseEnvironment() []string {
 	return environment
 }
 
-// makeProcessAlias exposes the current test binary under a helper process name
-// falls back to copying when the platform or filesystem disallows symlinks
+// Fall back to copying when the platform or filesystem disallows symlinks
 func makeProcessAlias(t *testing.T, name string) string {
 	t.Helper()
 	executable, err := os.Executable()
@@ -746,8 +718,6 @@ func makeProcessAlias(t *testing.T, name string) string {
 		return target
 	}
 
-	// Some environments prohibit symlinks
-	// Copying the already-built test executable retains hermetic helper behavior
 	source, err := os.Open(executable)
 	if err != nil {
 		t.Fatal(err)
@@ -767,7 +737,6 @@ func makeProcessAlias(t *testing.T, name string) string {
 	return target
 }
 
-// writeConfig creates a private per-test configuration file
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), configFileName)
@@ -777,7 +746,6 @@ func writeConfig(t *testing.T, content string) string {
 	return path
 }
 
-// readObservation decodes the single child-boundary record or fails its test
 func readObservation(t *testing.T, path string) observation {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -791,7 +759,6 @@ func readObservation(t *testing.T, path string) observation {
 	return observed
 }
 
-// assertEnvironment compares both variable presence and value
 func assertEnvironment(t *testing.T, observed observation, name string, wantSet bool, wantValue string) {
 	t.Helper()
 	value := observed.Environment[name]
@@ -800,7 +767,6 @@ func assertEnvironment(t *testing.T, observed observation, name string, wantSet 
 	}
 }
 
-// readCallLog decodes ordered JSON-lines argv records from the fake AWS process
 func readCallLog(t *testing.T, path string) [][]string {
 	t.Helper()
 	file, err := os.Open(path)

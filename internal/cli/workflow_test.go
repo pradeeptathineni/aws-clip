@@ -12,8 +12,6 @@ import (
 	"testing"
 )
 
-// TestPlanValidatesAndEvaluatesPolicyWithoutAWS protects offline review and JSON stability
-// plan output must omit argument values while retaining effective execution context
 func TestPlanValidatesAndEvaluatesPolicyWithoutAWS(t *testing.T) {
 	workflowPath := writeWorkflow(t, `{
   "schema_version": 1,
@@ -68,7 +66,6 @@ func TestPlanValidatesAndEvaluatesPolicyWithoutAWS(t *testing.T) {
 	}
 }
 
-// TestWorkflowPolicyRequiresExplicitWriteAllowanceAndDenyWins fixes policy precedence
 func TestWorkflowPolicyRequiresExplicitWriteAllowanceAndDenyWins(t *testing.T) {
 	workflowPath := writeWorkflow(t, `{
   "schema_version": 1,
@@ -108,8 +105,6 @@ func TestWorkflowPolicyRequiresExplicitWriteAllowanceAndDenyWins(t *testing.T) {
 	})
 }
 
-// TestRunRequiresNamedApprovalAndExecutesAllowedStepsInOrder covers both review gates
-// accepted workflows preserve declared order and expose per-step progress
 func TestRunRequiresNamedApprovalAndExecutesAllowedStepsInOrder(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
@@ -165,7 +160,6 @@ func TestRunRequiresNamedApprovalAndExecutesAllowedStepsInOrder(t *testing.T) {
 	})
 }
 
-// TestRunStopsAfterFirstAWSFailureAndReturnsItsStatus protects fail-fast execution
 func TestRunStopsAfterFirstAWSFailureAndReturnsItsStatus(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
@@ -192,7 +186,6 @@ func TestRunStopsAfterFirstAWSFailureAndReturnsItsStatus(t *testing.T) {
 	}
 }
 
-// TestWorkflowRunRequiresExplicitProfile blocks ambiguous default-account execution
 func TestWorkflowRunRequiresExplicitProfile(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
@@ -212,7 +205,6 @@ func TestWorkflowRunRequiresExplicitProfile(t *testing.T) {
 	}
 }
 
-// TestWorkflowValidationRejectsAmbiguousDefinitions covers strict and unique structure
 func TestWorkflowValidationRejectsAmbiguousDefinitions(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -248,7 +240,6 @@ func TestWorkflowValidationRejectsAmbiguousDefinitions(t *testing.T) {
 	}
 }
 
-// TestWorkflowPolicyConfigurationRejectsInvalidRulesAndLimits keeps policy deterministic
 func TestWorkflowPolicyConfigurationRejectsInvalidRulesAndLimits(t *testing.T) {
 	workflowPath := writeWorkflow(t, `{
   "schema_version": 1,
@@ -276,7 +267,6 @@ func TestWorkflowPolicyConfigurationRejectsInvalidRulesAndLimits(t *testing.T) {
 	}
 }
 
-// TestWildcardMatchUsesOnlyAsteriskSemantics excludes filesystem glob behavior
 func TestWildcardMatchUsesOnlyAsteriskSemantics(t *testing.T) {
 	tests := []struct {
 		pattern string
@@ -296,7 +286,6 @@ func TestWildcardMatchUsesOnlyAsteriskSemantics(t *testing.T) {
 	}
 }
 
-// TestSensitiveOutputOperationsRequireExplicitAllowance overrides read-name defaults
 func TestSensitiveOutputOperationsRequireExplicitAllowance(t *testing.T) {
 	commands := []string{
 		"cognito-identity:get-open-id-token",
@@ -319,7 +308,6 @@ func TestSensitiveOutputOperationsRequireExplicitAllowance(t *testing.T) {
 	}
 }
 
-// writeWorkflow creates a private per-test workflow document
 func writeWorkflow(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "workflow.json")
