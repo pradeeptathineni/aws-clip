@@ -629,11 +629,16 @@ func classifyExecutionCommand(arguments []string) executionOperation {
 	if command == "cloudformation:deploy" || command == "cloudformation:update-stack" || command == "ecs:update-service" {
 		operation.Costly = true
 	}
-	if command == "s3:rb" || command == "s3:rm" {
-		operation.Destructive = true
-	}
-	if command == "s3:sync" && containsString(arguments[2:], "--delete") {
-		operation.Destructive = true
+	if arguments[0] == "s3" {
+		switch arguments[1] {
+		case "cp", "mv", "sync":
+			operation.Costly = true
+		case "rb", "rm":
+			operation.Destructive = true
+		}
+		if arguments[1] == "sync" && containsString(arguments[2:], "--delete") {
+			operation.Destructive = true
+		}
 	}
 	return operation
 }

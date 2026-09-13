@@ -295,19 +295,32 @@ func TestProtectedProfileRequiresAccountApprovalForChanges(t *testing.T) {
 	}
 }
 
-func TestPotentiallyCostlyOperationRequiresAccountApproval(t *testing.T) {
+func TestPotentiallyCostlyOperationsRequireAccountApproval(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
-	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
-	rt, stdout, stderr := testRuntime(t, false, nil, "FAKE_CALL_LOG="+callLog)
-	command := []string{"ec2", "run-instances", "--image-id", "ami-example"}
-
-	arguments := append([]string{"--aws-binary", fake, "--profile", "development", "exec", "--"}, command...)
-	status := run(arguments, rt)
-	if status != exitPolicy || stdout.Len() != 0 || !strings.Contains(stderr.String(), "potentially costly operation") {
-		t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
+	tests := []struct {
+		name    string
+		command []string
+	}{
+		{"instance launch", []string{"ec2", "run-instances", "--image-id", "ami-example"}},
+		{"S3 copy", []string{"s3", "cp", "artifact", "s3://example/artifact"}},
+		{"S3 move", []string{"s3", "mv", "artifact", "s3://example/artifact"}},
+		{"S3 synchronization", []string{"s3", "sync", "build", "s3://example/site"}},
 	}
-	if containsCall(readCallLog(t, callLog), command) {
-		t.Fatal("potentially costly operation ran without account approval")
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			callLog := filepath.Join(t.TempDir(), "calls.jsonl")
+			rt, stdout, stderr := testRuntime(t, false, nil, "FAKE_CALL_LOG="+callLog)
+			arguments := append([]string{"--aws-binary", fake, "--profile", "development", "exec", "--"}, test.command...)
+
+			status := run(arguments, rt)
+
+			if status != exitPolicy || stdout.Len() != 0 || !strings.Contains(stderr.String(), "potentially costly operation") {
+				t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
+			}
+			if containsCall(readCallLog(t, callLog), test.command) {
+				t.Fatal("potentially costly operation ran without account approval")
+			}
+		})
 	}
 }
 

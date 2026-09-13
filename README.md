@@ -146,7 +146,8 @@ Destructive recognition covers common operation prefixes such as `delete-`,
 `terminate-`, `remove-`, `disable-`, `stop-`, and `revoke-`, plus `s3 rm`,
 `s3 rb`, and `s3 sync --delete`. Potential-cost recognition covers common
 `create-`, `launch-`, `purchase-`, `run-`, `scale-`, and `start-` operations,
-plus common deployment commands. These are conservative name-based checks, not
+S3 copy/move/sync, plus common deployment commands. These are conservative
+name-based checks, not
 replacements for IAM, service control policies, budgets, backups, or change
 management.
 
