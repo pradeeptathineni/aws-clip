@@ -77,6 +77,10 @@ profile, and built-in behavior.
 | `--connect-timeout SECONDS` | `AWS_CLIP_CONNECT_TIMEOUT` | `connect_timeout_seconds` | Prepends the AWS global `--cli-connect-timeout` option; `0` disables it |
 | `--read-timeout SECONDS` | `AWS_CLIP_READ_TIMEOUT` | `read_timeout_seconds` | Prepends the AWS global `--cli-read-timeout` option; `0` disables it |
 
+Text and path values must contain only printable, single-line characters.
+Control characters are rejected before the AWS CLI starts so diagnostics
+cannot be split or altered by terminal control sequences.
+
 The default file is `aws-clip/config.json` beneath the platform user
 configuration directory:
 

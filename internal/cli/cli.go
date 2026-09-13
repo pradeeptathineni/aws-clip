@@ -25,7 +25,7 @@ const (
 	versionOutputMax = 64 * 1024
 )
 
-var awsVersionPattern = regexp.MustCompile(`(?:^|[[:space:]])(aws-cli/([0-9]+)(?:\.[0-9A-Za-z_-]+)*)`)
+var awsVersionPattern = regexp.MustCompile(`^(aws-cli/([0-9]+)(?:\.[0-9A-Za-z_-]+)+)(?:[[:space:]]|$)`)
 
 // runtime contains the operating-system boundaries used by the application.
 // Keeping these values together makes configuration and TTY behavior testable
@@ -55,7 +55,7 @@ func Main(args []string, stdin *os.File, stdout, stderr *os.File) int {
 func run(args []string, rt runtime) int {
 	request, err := parseArguments(args)
 	if err != nil {
-		fmt.Fprintf(rt.stderr, "aws-clip: %v\n\n%s", err, usageText)
+		fmt.Fprintf(rt.stderr, "aws-clip: %s\n\n%s", printableLine(err.Error()), usageText)
 		return exitUsage
 	}
 	if request.help {
@@ -65,20 +65,20 @@ func run(args []string, rt runtime) int {
 
 	loaded, err := resolveSettings(request.flags, rt.environ, rt.userConfigDir)
 	if err != nil {
-		fmt.Fprintf(rt.stderr, "aws-clip: configuration error: %v\n", err)
+		fmt.Fprintf(rt.stderr, "aws-clip: configuration error: %s\n", printableLine(err.Error()))
 		return exitUsage
 	}
 
 	path, err := resolveAWSBinary(loaded.Settings.AWSBinary)
 	if err != nil {
-		fmt.Fprintf(rt.stderr, "aws-clip: %v\n", err)
+		fmt.Fprintf(rt.stderr, "aws-clip: %s\n", printableLine(err.Error()))
 		return exitNotFound
 	}
 
 	childEnvironment := effectiveEnvironment(rt.environ, loaded.Settings, rt.interactive)
 	info, err := inspectAWSVersion(path, childEnvironment)
 	if err != nil {
-		fmt.Fprintf(rt.stderr, "aws-clip: %v\n", err)
+		fmt.Fprintf(rt.stderr, "aws-clip: %s\n", printableLine(err.Error()))
 		if errors.Is(err, errAWSV1) || errors.Is(err, errUnverifiedVersion) {
 			return exitCannotRun
 		}
@@ -243,10 +243,14 @@ func resolveAWSBinary(configured string) (string, error) {
 
 func inspectAWSVersion(path string, environ []string) (awsInfo, error) {
 	var output bytes.Buffer
+	captured := &limitedWriter{writer: &output, remaining: versionOutputMax}
 	command := exec.Command(path, "--version")
 	command.Env = environ
-	command.Stdout = io.MultiWriter(&limitedWriter{writer: &output, remaining: versionOutputMax})
-	command.Stderr = io.MultiWriter(&limitedWriter{writer: &output, remaining: versionOutputMax})
+	// Use the same comparable writer for both streams. os/exec then serializes
+	// calls to Write, avoiding a data race in bytes.Buffer while retaining one
+	// combined bound for unexpectedly noisy or misconfigured executables.
+	command.Stdout = captured
+	command.Stderr = captured
 	if err := command.Run(); err != nil {
 		return awsInfo{}, fmt.Errorf("AWS CLI version check failed; confirm the configured executable can run: %w", err)
 	}
@@ -351,12 +355,12 @@ func writeDoctor(output io.Writer, info awsInfo, loaded loadedSettings, interact
 	}
 
 	fmt.Fprintln(output, "status: ok")
-	fmt.Fprintf(output, "aws_binary: %s\n", info.path)
-	fmt.Fprintf(output, "aws_version: %s\n", info.version)
-	fmt.Fprintf(output, "config_file: %s (%s)\n", loaded.ConfigPath, configState)
-	fmt.Fprintf(output, "profile: %s\n", displayOptionalString(loaded.Settings.Profile))
-	fmt.Fprintf(output, "region: %s\n", displayOptionalString(loaded.Settings.Region))
-	fmt.Fprintf(output, "retry_mode: %s\n", displayOptionalString(loaded.Settings.RetryMode))
+	fmt.Fprintf(output, "aws_binary: %s\n", printableLine(info.path))
+	fmt.Fprintf(output, "aws_version: %s\n", printableLine(info.version))
+	fmt.Fprintf(output, "config_file: %s (%s)\n", printableLine(loaded.ConfigPath), configState)
+	fmt.Fprintf(output, "profile: %s\n", printableLine(displayOptionalString(loaded.Settings.Profile)))
+	fmt.Fprintf(output, "region: %s\n", printableLine(displayOptionalString(loaded.Settings.Region)))
+	fmt.Fprintf(output, "retry_mode: %s\n", printableLine(displayOptionalString(loaded.Settings.RetryMode)))
 	fmt.Fprintf(output, "max_attempts: %s\n", displayOptionalInt(loaded.Settings.MaxAttempts))
 	fmt.Fprintf(output, "connect_timeout_seconds: %s\n", displayOptionalInt(loaded.Settings.ConnectTimeout))
 	fmt.Fprintf(output, "read_timeout_seconds: %s\n", displayOptionalInt(loaded.Settings.ReadTimeout))
@@ -377,9 +381,16 @@ func displayOptionalInt(value *int) string {
 	return strconv.Itoa(*value)
 }
 
-func isTerminal(file *os.File) bool {
-	info, err := file.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+// printableLine keeps diagnostic records structurally trustworthy even when a
+// path obtained from the operating system contains bytes that configuration
+// validation never saw (for example, an unusual current working directory).
+// Valid configured values are already printable and remain unchanged.
+func printableLine(value string) string {
+	if isPrintableSingleLine(value) {
+		return value
+	}
+	quoted := strconv.QuoteToGraphic(value)
+	return quoted[1 : len(quoted)-1]
 }
 
 const usageText = `Usage:

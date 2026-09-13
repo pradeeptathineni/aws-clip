@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const configFileName = "config.json"
@@ -91,11 +93,17 @@ func resolveConfigPath(flagPath *string, environ []string, configDir func() (str
 		if strings.TrimSpace(*flagPath) == "" {
 			return "", true, errors.New("--config requires a non-empty path")
 		}
+		if !isPrintableSingleLine(*flagPath) {
+			return "", true, errors.New("--config requires a printable single-line path")
+		}
 		return *flagPath, true, nil
 	}
 	if value, ok := lookupEnvironment(environ, "AWS_CLIP_CONFIG_FILE"); ok {
 		if strings.TrimSpace(value) == "" {
 			return "", true, errors.New("AWS_CLIP_CONFIG_FILE requires a non-empty path")
+		}
+		if !isPrintableSingleLine(value) {
+			return "", true, errors.New("AWS_CLIP_CONFIG_FILE requires a printable single-line path")
 		}
 		return value, true, nil
 	}
@@ -104,7 +112,11 @@ func resolveConfigPath(flagPath *string, environ []string, configDir func() (str
 	if err != nil {
 		return "", false, fmt.Errorf("determine user configuration directory: %w", err)
 	}
-	return filepath.Join(dir, "aws-clip", configFileName), false, nil
+	path = filepath.Join(dir, "aws-clip", configFileName)
+	if !isPrintableSingleLine(path) {
+		return "", false, errors.New("user configuration path must be printable and single-line")
+	}
+	return path, false, nil
 }
 
 func readConfig(path string, required bool) (fileSettings, bool, error) {
@@ -217,11 +229,20 @@ func validateSettings(settings Settings) error {
 	if strings.TrimSpace(settings.AWSBinary) == "" {
 		return errors.New("AWS binary path must not be empty")
 	}
+	if !isPrintableSingleLine(settings.AWSBinary) {
+		return errors.New("AWS binary path must be printable and single-line")
+	}
 	if settings.Profile != nil && strings.TrimSpace(*settings.Profile) == "" {
 		return errors.New("profile must not be empty")
 	}
+	if settings.Profile != nil && !isPrintableSingleLine(*settings.Profile) {
+		return errors.New("profile must be printable and single-line")
+	}
 	if settings.Region != nil && strings.TrimSpace(*settings.Region) == "" {
 		return errors.New("region must not be empty")
+	}
+	if settings.Region != nil && !isPrintableSingleLine(*settings.Region) {
+		return errors.New("region must be printable and single-line")
 	}
 	if settings.RetryMode != nil {
 		switch *settings.RetryMode {
@@ -240,4 +261,20 @@ func validateSettings(settings Settings) error {
 		return errors.New("read timeout must be 0 or greater")
 	}
 	return nil
+}
+
+// isPrintableSingleLine defines the text accepted for values that may appear in
+// diagnostics. Besides ASCII control characters, unicode.IsPrint excludes line
+// and paragraph separators, formatting controls, and other runes that can alter
+// terminal presentation. Invalid UTF-8 is rejected so output stays portable.
+func isPrintableSingleLine(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if !unicode.IsPrint(character) {
+			return false
+		}
+	}
+	return true
 }

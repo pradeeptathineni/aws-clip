@@ -199,6 +199,40 @@ func TestNonTTYDisablesPagerAndAutoPromptWithoutAddingOutput(t *testing.T) {
 	assertEnvironment(t, observed, "AWS_CLI_AUTO_PROMPT", true, "off")
 }
 
+func TestProcessWithNullStreamsDisablesPagerAndAutoPrompt(t *testing.T) {
+	wrapper := makeProcessAlias(t, "fake-wrapper")
+	fake := makeProcessAlias(t, "fake-aws")
+	configPath := writeConfig(t, `{}`)
+	observationPath := filepath.Join(t.TempDir(), "observation.json")
+
+	null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+
+	command := exec.Command(wrapper,
+		"--config", configPath,
+		"--aws-binary", fake,
+		"exec", "--", "sts", "get-caller-identity",
+	)
+	command.Env = append(baseEnvironment(),
+		"AWS_PAGER=operator-pager",
+		"AWS_CLI_AUTO_PROMPT=on",
+		"FAKE_OBSERVATION_PATH="+observationPath,
+	)
+	command.Stdin = null
+	command.Stdout = null
+	command.Stderr = null
+	if err := command.Run(); err != nil {
+		t.Fatalf("wrapper with null streams failed: %v", err)
+	}
+
+	observed := readObservation(t, observationPath)
+	assertEnvironment(t, observed, "AWS_PAGER", true, "")
+	assertEnvironment(t, observed, "AWS_CLI_AUTO_PROMPT", true, "off")
+}
+
 func TestTTYLeavesPagerAndAutoPromptUntouched(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	observationPath := filepath.Join(t.TempDir(), "observation.json")
@@ -369,6 +403,72 @@ func TestDoctorChecksLocallyAndDoesNotExposeCredentials(t *testing.T) {
 	}
 }
 
+func TestConfiguredControlCharactersCannotInjectDiagnostics(t *testing.T) {
+	fake := makeProcessAlias(t, "fake-aws")
+	tests := []struct {
+		name        string
+		arguments   []string
+		environment []string
+		wantError   string
+	}{
+		{
+			name:      "profile flag",
+			arguments: []string{"--aws-binary", fake, "--profile", "operations\nstatus: forged", "doctor"},
+			wantError: "profile must be printable and single-line",
+		},
+		{
+			name:        "region environment",
+			arguments:   []string{"--aws-binary", fake, "doctor"},
+			environment: []string{"AWS_CLIP_REGION=us-east-1\x1b[2Jstatus: forged"},
+			wantError:   "region must be printable and single-line",
+		},
+		{
+			name:        "binary environment",
+			arguments:   []string{"doctor"},
+			environment: []string{"AWS_CLIP_AWS_BINARY=" + fake + "\rstatus: forged"},
+			wantError:   "AWS binary path must be printable and single-line",
+		},
+		{
+			name:        "configuration path environment",
+			arguments:   []string{"doctor"},
+			environment: []string{"AWS_CLIP_CONFIG_FILE=missing\nstatus: forged"},
+			wantError:   "AWS_CLIP_CONFIG_FILE requires a printable single-line path",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rt, stdout, stderr := testRuntime(t, false, nil, test.environment...)
+			status := run(test.arguments, rt)
+			if status != exitUsage || stdout.Len() != 0 || !strings.Contains(stderr.String(), test.wantError) {
+				t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
+			}
+			if strings.Contains(stderr.String(), "forged") || strings.Count(stderr.String(), "\n") != 1 {
+				t.Fatalf("diagnostic included configured control text: %q", stderr.String())
+			}
+		})
+	}
+}
+
+func TestDoctorEscapesUnsafeOSDerivedValues(t *testing.T) {
+	var output bytes.Buffer
+	writeDoctor(&output, awsInfo{
+		path:    "/working\ndirectory/aws",
+		version: "aws-cli/2.17.0",
+	}, loadedSettings{
+		Settings:   Settings{AWSBinary: "aws"},
+		ConfigPath: "/config\x1b[2J/file",
+	}, false)
+
+	if strings.Contains(output.String(), "/working\ndirectory") || strings.Contains(output.String(), "\x1b") {
+		t.Fatalf("doctor emitted raw control characters: %q", output.String())
+	}
+	if !strings.Contains(output.String(), `aws_binary: /working\ndirectory/aws`) ||
+		!strings.Contains(output.String(), `config_file: /config\x1b[2J/file`) {
+		t.Fatalf("doctor did not escape unsafe values: %q", output.String())
+	}
+}
+
 func TestMissingAndV1AWSAreRejectedBeforeExecution(t *testing.T) {
 	t.Run("missing binary", func(t *testing.T) {
 		rt, stdout, stderr := testRuntime(t, false, nil)
@@ -392,6 +492,22 @@ func TestMissingAndV1AWSAreRejectedBeforeExecution(t *testing.T) {
 		}
 		if _, err := os.Stat(observationPath); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("AWS operation ran after v1 rejection")
+		}
+	})
+
+	t.Run("version token does not begin output", func(t *testing.T) {
+		fake := makeProcessAlias(t, "fake-aws")
+		observationPath := filepath.Join(t.TempDir(), "operation.json")
+		rt, stdout, stderr := testRuntime(t, false, nil,
+			"FAKE_AWS_VERSION=unexpected prefix aws-cli/2.17.0 Python/3.12.0",
+			"FAKE_OBSERVATION_PATH="+observationPath,
+		)
+		status := run([]string{"--aws-binary", fake, "exec", "--", "sts", "get-caller-identity"}, rt)
+		if status != exitCannotRun || stdout.Len() != 0 || !strings.Contains(stderr.String(), "version could not be verified") {
+			t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
+		}
+		if _, err := os.Stat(observationPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("AWS operation ran after malformed version output")
 		}
 	})
 }
