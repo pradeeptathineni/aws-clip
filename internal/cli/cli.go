@@ -1,6 +1,7 @@
-// Package cli implements aws-clip's workflow, policy, command-line, and process
-// boundaries. AWS service behavior deliberately remains in the installed AWS
-// CLI v2 while this package provides local review and execution controls.
+// cli.go - Parse commands and coordinate AWS CLI-backed operations
+// Package cli implements aws-clip's profile lifecycle, identity guards,
+// workflows, command-line, and process boundaries. AWS service and credential
+// behavior deliberately remain in the installed AWS CLI v2.
 package cli
 
 import (
@@ -68,6 +69,10 @@ func run(args []string, rt runtime) int {
 		fmt.Fprintf(rt.stderr, "aws-clip: configuration error: %s\n", printableLine(err.Error()))
 		return exitUsage
 	}
+	if requiresExplicitProfile(request.command) && loaded.Settings.Profile == nil {
+		fmt.Fprintln(rt.stderr, "aws-clip: an explicit profile is required; use --profile, AWS_CLIP_PROFILE, or profile in the configuration file")
+		return exitUsage
+	}
 	if request.command == "plan" || request.command == "run" {
 		candidate, err := readWorkflow(request.workflowPath, loaded.Settings.WorkflowPolicy.MaxSteps)
 		if err != nil {
@@ -109,6 +114,13 @@ func run(args []string, rt runtime) int {
 			fmt.Fprintf(rt.stderr, "aws-clip: %s\n", printableLine(err.Error()))
 			return exitCannotRun
 		}
+		commands := make([]executionOperation, 0, len(candidate.Steps))
+		for _, step := range candidate.Steps {
+			commands = append(commands, classifyExecutionCommand(step.Command))
+		}
+		if _, status := prepareProfileExecution(path, loaded.Settings, childEnvironment, rt, commands, request.approvalAccount); status != exitOK {
+			return status
+		}
 		return runWorkflow(path, candidate, loaded.Settings, childEnvironment, rt)
 	}
 
@@ -129,12 +141,18 @@ func run(args []string, rt runtime) int {
 	}
 
 	switch request.command {
+	case "profiles":
+		return runProfiles(path, loaded.Settings, childEnvironment, request.format, rt)
+	case "login":
+		return runLogin(path, loaded.Settings, childEnvironment, rt)
+	case "logout":
+		return runLogout(path, loaded.Settings, childEnvironment, request.approval, rt)
+	case "context":
+		return runContext(path, loaded.Settings, childEnvironment, request.format, rt)
 	case "doctor":
-		writeDoctor(rt.stdout, info, loaded, rt.interactive)
-		return exitOK
+		return runDoctor(path, info, loaded, childEnvironment, rt)
 	case "exec":
-		awsArguments := effectiveArguments(request.awsArguments, loaded.Settings)
-		return runAWS(path, awsArguments, childEnvironment, rt.stdin, rt.stdout, rt.stderr)
+		return runProfileExec(path, request.awsArguments, loaded.Settings, childEnvironment, request.approvalAccount, rt)
 	default:
 		// parseArguments owns command validation. Keep this guard so a future
 		// parser change fails closed instead of accidentally executing AWS.
@@ -143,16 +161,30 @@ func run(args []string, rt runtime) int {
 	}
 }
 
+// requiresExplicitProfile identifies commands whose value depends on proving
+// one named profile's identity. Discovery, planning, and an unscoped doctor
+// remain useful before an operator has selected a profile.
+func requiresExplicitProfile(command string) bool {
+	switch command {
+	case "login", "logout", "context", "exec", "run":
+		return true
+	default:
+		return false
+	}
+}
+
 type request struct {
-	command      string
-	flags        overrides
-	awsArguments []string
-	workflowPath string
-	approval     string
-	format       string
-	approvalSet  bool
-	formatSet    bool
-	help         bool
+	command            string
+	flags              overrides
+	awsArguments       []string
+	workflowPath       string
+	approval           string
+	format             string
+	approvalAccount    string
+	approvalSet        bool
+	approvalAccountSet bool
+	formatSet          bool
+	help               bool
 }
 
 func parseArguments(args []string) (request, error) {
@@ -164,7 +196,7 @@ func parseArguments(args []string) (request, error) {
 			result.help = true
 			return result, nil
 		}
-		if argument == "exec" || argument == "doctor" || argument == "plan" || argument == "run" {
+		if isCommand(argument) {
 			if result.command != "" {
 				return request{}, errors.New("exactly one command is required")
 			}
@@ -204,6 +236,9 @@ func parseArguments(args []string) (request, error) {
 			case "--format":
 				result.format = value
 				result.formatSet = true
+			case "--approve-account":
+				result.approvalAccount = value
+				result.approvalAccountSet = true
 			default:
 				if err := setOption(&result.flags, name, value); err != nil {
 					return request{}, err
@@ -212,7 +247,7 @@ func parseArguments(args []string) (request, error) {
 			continue
 		}
 		if result.command == "" {
-			return request{}, errors.New("expected plan, run, exec, or doctor")
+			return request{}, errors.New("expected profiles, login, logout, context, exec, doctor, plan, or run")
 		}
 		if result.command == "plan" || result.command == "run" {
 			if result.workflowPath != "" {
@@ -225,7 +260,7 @@ func parseArguments(args []string) (request, error) {
 	}
 
 	if result.command == "" {
-		return request{}, errors.New("expected plan, run, exec, or doctor")
+		return request{}, errors.New("expected profiles, login, logout, context, exec, doctor, plan, or run")
 	}
 	if result.command == "exec" {
 		return request{}, errors.New("exec requires the -- separator")
@@ -236,10 +271,13 @@ func parseArguments(args []string) (request, error) {
 	if result.workflowPath != "" && !isPrintableSingleLine(result.workflowPath) {
 		return request{}, errors.New("workflow file path must be printable and single-line")
 	}
-	if result.command != "run" && result.approvalSet {
-		return request{}, errors.New("--approve is valid only with run")
+	if result.command != "run" && result.command != "logout" && result.approvalSet {
+		return request{}, errors.New("--approve is valid only with run or logout")
 	}
-	if result.command == "plan" {
+	if result.command != "run" && result.command != "exec" && result.approvalAccountSet {
+		return request{}, errors.New("--approve-account is valid only with exec or run")
+	}
+	if result.command == "plan" || result.command == "profiles" || result.command == "context" {
 		if !result.formatSet {
 			result.format = "text"
 		}
@@ -247,14 +285,25 @@ func parseArguments(args []string) (request, error) {
 			return request{}, errors.New("--format must be text or json")
 		}
 	} else if result.formatSet {
-		return request{}, errors.New("--format is valid only with plan")
+		return request{}, errors.New("--format is valid only with plan, profiles, or context")
 	}
 	return result, nil
 }
 
+// isCommand centralizes public command recognition so parsing and usage errors
+// cannot drift as the profile/session surface evolves.
+func isCommand(value string) bool {
+	switch value {
+	case "profiles", "login", "logout", "context", "exec", "doctor", "plan", "run":
+		return true
+	default:
+		return false
+	}
+}
+
 func recognizedOption(name string) bool {
 	switch name {
-	case "--config", "--aws-binary", "--profile", "--region", "--retry-mode", "--max-attempts", "--connect-timeout", "--read-timeout", "--approve", "--format":
+	case "--config", "--aws-binary", "--profile", "--region", "--retry-mode", "--max-attempts", "--connect-timeout", "--read-timeout", "--approve", "--approve-account", "--format":
 		return true
 	default:
 		return false
@@ -440,7 +489,7 @@ func writeDoctor(output io.Writer, info awsInfo, loaded loadedSettings, interact
 		configState = "loaded"
 	}
 
-	fmt.Fprintln(output, "status: ok")
+	fmt.Fprintln(output, "aws_cli: ok")
 	fmt.Fprintf(output, "aws_binary: %s\n", printableLine(info.path))
 	fmt.Fprintf(output, "aws_version: %s\n", printableLine(info.version))
 	fmt.Fprintf(output, "config_file: %s (%s)\n", printableLine(loaded.ConfigPath), configState)
@@ -452,6 +501,7 @@ func writeDoctor(output io.Writer, info awsInfo, loaded loadedSettings, interact
 	fmt.Fprintf(output, "read_timeout_seconds: %s\n", displayOptionalInt(loaded.Settings.ReadTimeout))
 	fmt.Fprintf(output, "workflow_policy: read-oriented default; %d allow rules; %d deny rules; max %d steps\n",
 		len(loaded.Settings.WorkflowPolicy.Allow), len(loaded.Settings.WorkflowPolicy.Deny), loaded.Settings.WorkflowPolicy.MaxSteps)
+	fmt.Fprintf(output, "protected_profiles: %d\n", len(loaded.Settings.ProtectedProfiles))
 	fmt.Fprintf(output, "stream_mode: %s\n", mode)
 }
 
@@ -482,10 +532,14 @@ func printableLine(value string) string {
 }
 
 const usageText = `Usage:
-  aws-clip [wrapper options] plan [--format text|json] <workflow.json>
-  aws-clip [wrapper options] run --approve NAME <workflow.json>
-  aws-clip [wrapper options] exec [wrapper options] -- <aws arguments...>
+  aws-clip [wrapper options] profiles [--format text|json]
+  aws-clip [wrapper options] login
+  aws-clip [wrapper options] logout [--approve all-sso-sessions]
+  aws-clip [wrapper options] context [--format text|json]
+  aws-clip [wrapper options] exec [--approve-account ID] -- <aws arguments...>
   aws-clip [wrapper options] doctor
+  aws-clip [wrapper options] plan [--format text|json] <workflow.json>
+  aws-clip [wrapper options] run --approve NAME [--approve-account ID] <workflow.json>
 
 Wrapper options:
   --config PATH             Override the user configuration file
@@ -497,11 +551,18 @@ Wrapper options:
   --connect-timeout SECONDS Set the socket connection timeout (0 disables)
   --read-timeout SECONDS    Set the socket read timeout (0 disables)
 
-Workflow options:
-  --format text|json         Select plan output; defaults to text
+Output and workflow options:
+  --format text|json         Select text or stable JSON output
   --approve NAME             Confirm the exact workflow name for run
 
-Plan validates a workflow and evaluates local policy without running AWS CLI.
-Run executes allowed steps in order and stops on the first failure. The --
-separator is mandatory for exec; arguments after it bypass workflow safeguards.
+Safety options:
+  --approve-account ID       Confirm the verified account for guarded execution
+  --approve all-sso-sessions Confirm the global effect of AWS SSO logout
+
+Profiles, login, logout, context, exec, and doctor delegate configuration,
+authentication, credentials, and service calls to AWS CLI v2. Exec requires an
+explicit profile, verifies its STS identity, and applies account guards. Plan
+and run retain policy-controlled sequences for operations that need review,
+named approval, fail-fast behavior, and step visibility. The -- separator is
+mandatory for exec, and every following value remains a literal AWS argument.
 `

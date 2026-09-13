@@ -1,3 +1,4 @@
+// cli_test.go - Exercise command parsing, process boundaries, and configuration
 package cli
 
 import (
@@ -55,6 +56,58 @@ func fakeAWS() {
 		fmt.Fprintln(os.Stdout, version)
 		return
 	}
+	if isFakeConfigureCommand(arguments, "list-profiles") {
+		profiles := os.Getenv("FAKE_PROFILES")
+		if profiles == "" {
+			profiles = "operations\n"
+		}
+		_, _ = io.WriteString(os.Stdout, profiles)
+		return
+	}
+	if key, profile, ok := fakeConfigureGet(arguments); ok {
+		var profiles map[string]map[string]string
+		if encoded := os.Getenv("FAKE_CONFIG_JSON"); encoded != "" {
+			if json.Unmarshal([]byte(encoded), &profiles) != nil {
+				os.Exit(124)
+			}
+		}
+		if value, exists := profiles[profile][key]; exists {
+			fmt.Fprintln(os.Stdout, value)
+			return
+		}
+		os.Exit(1)
+	}
+	if isFakeIdentityRequest(arguments) {
+		if marker := os.Getenv("FAKE_IDENTITY_FAIL_ONCE"); marker != "" {
+			if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
+				if os.WriteFile(marker, []byte("failed"), 0o600) != nil {
+					os.Exit(125)
+				}
+				fmt.Fprintln(os.Stderr, "fake expired session")
+				os.Exit(255)
+			}
+		}
+		if value := os.Getenv("FAKE_IDENTITY_EXIT_CODE"); value != "" {
+			code, err := strconv.Atoi(value)
+			if err != nil {
+				os.Exit(126)
+			}
+			_, _ = io.WriteString(os.Stderr, os.Getenv("FAKE_IDENTITY_STDERR"))
+			os.Exit(code)
+		}
+		identity := os.Getenv("FAKE_IDENTITY_JSON")
+		if identity == "" {
+			identity = `{"Account":"123456789012","Arn":"arn:aws:sts::123456789012:assumed-role/Operator/test","UserId":"AROAEXAMPLE:test"}`
+		}
+		fmt.Fprintln(os.Stdout, identity)
+		return
+	}
+	if len(arguments) == 2 && arguments[0] == "login" && arguments[1] == "help" {
+		if os.Getenv("FAKE_NO_LOCAL_LOGIN") != "" {
+			os.Exit(1)
+		}
+		return
+	}
 
 	if path := os.Getenv("FAKE_OBSERVATION_PATH"); path != "" {
 		environment := make(map[string]observedEnvironment)
@@ -101,6 +154,38 @@ func fakeAWS() {
 	}
 }
 
+func isFakeConfigureCommand(arguments []string, operation string) bool {
+	return len(arguments) == 2 && arguments[0] == "configure" && arguments[1] == operation
+}
+
+func fakeConfigureGet(arguments []string) (key, profile string, ok bool) {
+	if len(arguments) != 5 || arguments[0] != "configure" || arguments[1] != "get" || arguments[3] != "--profile" {
+		return "", "", false
+	}
+	return arguments[2], arguments[4], true
+}
+
+func isFakeIdentityRequest(arguments []string) bool {
+	for index := 0; index+1 < len(arguments); index++ {
+		if arguments[index] == "sts" && arguments[index+1] == "get-caller-identity" {
+			return containsString(arguments, "--query")
+		}
+	}
+	return false
+}
+
+func fakeIdentityArguments() []string {
+	return []string{
+		"sts", "get-caller-identity",
+		"--output", "json",
+		"--query", "{Account:Account,Arn:Arn,UserId:UserId}",
+	}
+}
+
+func fakeProfileRegionArguments(profile string) []string {
+	return []string{"configure", "get", "region", "--profile", profile}
+}
+
 func appendCallLog(arguments []string) {
 	path := os.Getenv("FAKE_CALL_LOG")
 	if path == "" {
@@ -139,11 +224,11 @@ func TestExecPassesArgumentsLiterallyAndReturnsAWSStatus(t *testing.T) {
 		"FAKE_EXIT_CODE=37",
 	)
 
-	status := run(append([]string{"--aws-binary", fake, "exec", "--"}, arguments...), rt)
+	status := run(append([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--"}, arguments...), rt)
 	if status != 37 {
 		t.Fatalf("status = %d, want 37; stderr = %q", status, stderr.String())
 	}
-	if stdout.String() != "aws output\n" || stderr.String() != "aws diagnostic\n" {
+	if stdout.String() != "aws output\n" || !strings.Contains(stderr.String(), "context profile=operations account=123456789012") || !strings.HasSuffix(stderr.String(), "aws diagnostic\n") {
 		t.Fatalf("streams changed: stdout %q, stderr %q", stdout.String(), stderr.String())
 	}
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
@@ -154,8 +239,8 @@ func TestExecPassesArgumentsLiterallyAndReturnsAWSStatus(t *testing.T) {
 	if !reflect.DeepEqual(observed.Arguments, arguments) {
 		t.Fatalf("arguments = %#v, want %#v", observed.Arguments, arguments)
 	}
-	if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, [][]string{{"--version"}, arguments}) {
-		t.Fatalf("process calls = %#v, want one version check and one AWS operation", calls)
+	if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, [][]string{{"--version"}, fakeIdentityArguments(), fakeProfileRegionArguments("operations"), arguments}) {
+		t.Fatalf("process calls = %#v, want version, identity preflight, and AWS operation", calls)
 	}
 }
 
@@ -164,7 +249,7 @@ func TestExecPreservesBinaryStdinStdoutAndStderr(t *testing.T) {
 	input := []byte{0x00, 'i', 'n', '\n', 0xff}
 	rt, stdout, stderr := testRuntime(t, false, bytes.NewReader(input), "FAKE_MODE=binary-streams")
 
-	status := run([]string{"--aws-binary", fake, "exec", "--", "service", "operation"}, rt)
+	status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "service", "operation"}, rt)
 	if status != 0 {
 		t.Fatalf("status = %d, want 0; stderr = %q", status, stderr.Bytes())
 	}
@@ -172,8 +257,8 @@ func TestExecPreservesBinaryStdinStdoutAndStderr(t *testing.T) {
 	if !bytes.Equal(stdout.Bytes(), wantStdout) {
 		t.Fatalf("stdout bytes = %v, want %v", stdout.Bytes(), wantStdout)
 	}
-	if want := []byte{0xfe, '\r', '\n', 0x00}; !bytes.Equal(stderr.Bytes(), want) {
-		t.Fatalf("stderr bytes = %v, want %v", stderr.Bytes(), want)
+	if want := []byte{0xfe, '\r', '\n', 0x00}; !bytes.HasSuffix(stderr.Bytes(), want) {
+		t.Fatalf("stderr bytes = %v, want AWS bytes as suffix %v", stderr.Bytes(), want)
 	}
 }
 
@@ -187,8 +272,8 @@ func TestNonTTYDisablesPagerAndAutoPromptWithoutAddingOutput(t *testing.T) {
 		"FAKE_STDOUT=only child output\n",
 	)
 
-	status := run([]string{"--aws-binary", fake, "exec", "--", "sts", "get-caller-identity"}, rt)
-	if status != 0 || stderr.Len() != 0 {
+	status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "sts", "get-caller-identity"}, rt)
+	if status != 0 || !strings.Contains(stderr.String(), "context profile=operations") {
 		t.Fatalf("status = %d, stderr = %q", status, stderr.String())
 	}
 	if stdout.String() != "only child output\n" {
@@ -214,6 +299,7 @@ func TestProcessWithNullStreamsDisablesPagerAndAutoPrompt(t *testing.T) {
 	command := exec.Command(wrapper,
 		"--config", configPath,
 		"--aws-binary", fake,
+		"--profile", "operations",
 		"exec", "--", "sts", "get-caller-identity",
 	)
 	command.Env = append(baseEnvironment(),
@@ -242,7 +328,7 @@ func TestTTYLeavesPagerAndAutoPromptUntouched(t *testing.T) {
 		"FAKE_OBSERVATION_PATH="+observationPath,
 	)
 
-	status := run([]string{"--aws-binary", fake, "exec", "--", "ec2", "describe-regions"}, rt)
+	status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "ec2", "describe-regions"}, rt)
 	if status != 0 {
 		t.Fatalf("status = %d, stderr = %q", status, stderr.String())
 	}
@@ -362,11 +448,12 @@ func TestConfigurationPrecedenceAndAWSDeferral(t *testing.T) {
 			"AWS_CLIP_CONFIG_FILE="+configPath,
 			"FAKE_OBSERVATION_PATH="+observationPath,
 		)
-		if status := run([]string{"--aws-binary", fake, "exec", "--", "sts", "get-caller-identity"}, rt); status != 0 {
+		if status := run([]string{"--aws-binary", fake, "--profile", "default", "exec", "--", "sts", "get-caller-identity"}, rt); status != 0 {
 			t.Fatalf("status = %d; stderr = %q", status, stderr.String())
 		}
 		observed := readObservation(t, observationPath)
-		for _, name := range []string{"AWS_PROFILE", "AWS_REGION", "AWS_RETRY_MODE", "AWS_MAX_ATTEMPTS"} {
+		assertEnvironment(t, observed, "AWS_PROFILE", true, "default")
+		for _, name := range []string{"AWS_REGION", "AWS_RETRY_MODE", "AWS_MAX_ATTEMPTS"} {
 			assertEnvironment(t, observed, name, false, "")
 		}
 		if want := []string{"sts", "get-caller-identity"}; !reflect.DeepEqual(observed.Arguments, want) {
@@ -375,7 +462,7 @@ func TestConfigurationPrecedenceAndAWSDeferral(t *testing.T) {
 	})
 }
 
-func TestDoctorChecksLocallyAndDoesNotExposeCredentials(t *testing.T) {
+func TestDoctorReportsCredentialEnvironmentWithoutExposingValues(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
 	secret := "credential-value-that-must-not-appear"
@@ -386,20 +473,21 @@ func TestDoctorChecksLocallyAndDoesNotExposeCredentials(t *testing.T) {
 	)
 
 	status := run([]string{"--aws-binary", fake, "--profile", "operations", "--region", "us-east-1", "doctor"}, rt)
-	if status != 0 || stderr.Len() != 0 {
+	if status != exitPolicy || stderr.Len() != 0 {
 		t.Fatalf("status = %d, stderr = %q", status, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "aws_version: aws-cli/2.17.0") ||
 		!strings.Contains(stdout.String(), "profile: operations") ||
-		!strings.Contains(stdout.String(), "region: us-east-1") {
+		!strings.Contains(stdout.String(), "region: us-east-1") ||
+		!strings.Contains(stdout.String(), "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY") {
 		t.Fatalf("doctor output lacks effective context: %q", stdout.String())
 	}
 	if strings.Contains(stdout.String(), secret) || strings.Contains(stderr.String(), secret) || strings.Contains(stdout.String(), "access-key-that-must-not-appear") {
 		t.Fatalf("doctor exposed credential material")
 	}
 	calls := readCallLog(t, callLog)
-	if want := [][]string{{"--version"}}; !reflect.DeepEqual(calls, want) {
-		t.Fatalf("doctor calls = %#v, want only a version check", calls)
+	if want := [][]string{{"--version"}, {"configure", "list-profiles"}}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("doctor calls = %#v, want version and local profile discovery", calls)
 	}
 }
 
@@ -486,7 +574,7 @@ func TestMissingAndV1AWSAreRejectedBeforeExecution(t *testing.T) {
 			"FAKE_AWS_VERSION=aws-cli/1.32.0 Python/3.11.0 test/1.0",
 			"FAKE_OBSERVATION_PATH="+observationPath,
 		)
-		status := run([]string{"--aws-binary", fake, "exec", "--", "sts", "get-caller-identity"}, rt)
+		status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "sts", "get-caller-identity"}, rt)
 		if status != exitCannotRun || stdout.Len() != 0 || !strings.Contains(stderr.String(), "AWS CLI v1") || !strings.Contains(stderr.String(), "install AWS CLI v2") {
 			t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 		}
@@ -502,7 +590,7 @@ func TestMissingAndV1AWSAreRejectedBeforeExecution(t *testing.T) {
 			"FAKE_AWS_VERSION=unexpected prefix aws-cli/2.17.0 Python/3.12.0",
 			"FAKE_OBSERVATION_PATH="+observationPath,
 		)
-		status := run([]string{"--aws-binary", fake, "exec", "--", "sts", "get-caller-identity"}, rt)
+		status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "sts", "get-caller-identity"}, rt)
 		if status != exitCannotRun || stdout.Len() != 0 || !strings.Contains(stderr.String(), "version could not be verified") {
 			t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 		}
@@ -522,6 +610,7 @@ func TestExecForwardsInterruptAndReportsSignalStatus(t *testing.T) {
 	command := exec.Command(wrapper,
 		"--config", configPath,
 		"--aws-binary", fake,
+		"--profile", "operations",
 		"exec", "--", "sts", "get-caller-identity",
 	)
 	command.Env = append(baseEnvironment(), "FAKE_MODE=wait-for-signal")

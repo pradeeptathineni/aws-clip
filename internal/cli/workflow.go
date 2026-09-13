@@ -1,3 +1,4 @@
+// workflow.go - Validate, preview, and execute policy-controlled AWS sequences
 package cli
 
 import (
@@ -40,12 +41,13 @@ type workflowStep struct {
 // contain secrets or large request documents, while the service, operation,
 // descriptions, and policy decisions provide a useful review boundary.
 type workflowPlan struct {
-	SchemaVersion int                `json:"schema_version"`
-	Name          string             `json:"name"`
-	Description   string             `json:"description,omitempty"`
-	Context       workflowContext    `json:"context"`
-	Steps         []workflowPlanStep `json:"steps"`
-	Allowed       bool               `json:"allowed"`
+	SchemaVersion           int                `json:"schema_version"`
+	Name                    string             `json:"name"`
+	Description             string             `json:"description,omitempty"`
+	Context                 workflowContext    `json:"context"`
+	Steps                   []workflowPlanStep `json:"steps"`
+	Allowed                 bool               `json:"allowed"`
+	AccountApprovalRequired bool               `json:"account_approval_required"`
 }
 
 type workflowContext struct {
@@ -55,6 +57,8 @@ type workflowContext struct {
 	MaxAttempts           *int    `json:"max_attempts"`
 	ConnectTimeoutSeconds *int    `json:"connect_timeout_seconds"`
 	ReadTimeoutSeconds    *int    `json:"read_timeout_seconds"`
+	Protected             bool    `json:"protected"`
+	ExpectedAccountID     *string `json:"expected_account_id,omitempty"`
 }
 
 type workflowPlanStep struct {
@@ -169,6 +173,9 @@ func validateWorkflowCommand(label string, command []string) error {
 	if !isAWSCommandToken(command[0]) || !isAWSCommandToken(command[1]) {
 		return fmt.Errorf("%s command must begin with a lowercase AWS service and operation", label)
 	}
+	if option := contextOverrideArgument(command[2:]); option != "" {
+		return fmt.Errorf("%s command contains %s, which would invalidate the verified profile context", label, option)
+	}
 	return nil
 }
 
@@ -192,6 +199,14 @@ func isLowercaseLetterOrDigit(character byte) bool {
 }
 
 func buildWorkflowPlan(candidate workflow, settings Settings) workflowPlan {
+	var expectedAccount *string
+	protected := false
+	if settings.Profile != nil {
+		if account, exists := settings.ProtectedProfiles[*settings.Profile]; exists {
+			protected = true
+			expectedAccount = stringPointer(account)
+		}
+	}
 	result := workflowPlan{
 		SchemaVersion: 1,
 		Name:          candidate.Name,
@@ -203,12 +218,18 @@ func buildWorkflowPlan(candidate workflow, settings Settings) workflowPlan {
 			MaxAttempts:           cloneOptionalInt(settings.MaxAttempts),
 			ConnectTimeoutSeconds: cloneOptionalInt(settings.ConnectTimeout),
 			ReadTimeoutSeconds:    cloneOptionalInt(settings.ReadTimeout),
+			Protected:             protected,
+			ExpectedAccountID:     expectedAccount,
 		},
 		Steps:   make([]workflowPlanStep, 0, len(candidate.Steps)),
 		Allowed: true,
 	}
 	for index, step := range candidate.Steps {
 		command := step.Command[0] + ":" + step.Command[1]
+		classification := classifyExecutionCommand(step.Command)
+		if classification.Destructive || classification.Costly || classification.Sensitive || protected && classification.Changing {
+			result.AccountApprovalRequired = true
+		}
 		allowed, reason := evaluateWorkflowCommand(command, settings.WorkflowPolicy)
 		decision := "allow"
 		if !allowed {
@@ -356,6 +377,11 @@ func writeWorkflowPlanText(output io.Writer, plan workflowPlan) {
 	fmt.Fprintf(output, "Execution: retry_mode=%s max_attempts=%s connect_timeout_seconds=%s read_timeout_seconds=%s\n",
 		displayOptionalString(plan.Context.RetryMode), displayOptionalInt(plan.Context.MaxAttempts),
 		displayOptionalInt(plan.Context.ConnectTimeoutSeconds), displayOptionalInt(plan.Context.ReadTimeoutSeconds))
+	if plan.Context.Protected {
+		fmt.Fprintf(output, "Account guard: protected expected=%s approval_required=%t\n", *plan.Context.ExpectedAccountID, plan.AccountApprovalRequired)
+	} else {
+		fmt.Fprintf(output, "Account guard: standard approval_required=%t\n", plan.AccountApprovalRequired)
+	}
 	fmt.Fprintln(output, "Steps:")
 	for _, step := range plan.Steps {
 		fmt.Fprintf(output, "  %d. %s [%s] %s", step.Index, step.Name, step.Decision, step.Command)
@@ -379,8 +405,6 @@ func writeWorkflowPlanJSON(output io.Writer, plan workflowPlan) error {
 
 func runWorkflow(awsPath string, candidate workflow, settings Settings, environ []string, rt runtime) int {
 	fmt.Fprintf(rt.stderr, "aws-clip: workflow %q: starting %d steps\n", candidate.Name, len(candidate.Steps))
-	fmt.Fprintf(rt.stderr, "aws-clip: context: profile=%s region=%s\n",
-		printableLine(displayOptionalString(settings.Profile)), printableLine(displayOptionalString(settings.Region)))
 	for index, step := range candidate.Steps {
 		command := step.Command[0] + ":" + step.Command[1]
 		fmt.Fprintf(rt.stderr, "aws-clip: step %d/%d %q (%s): started\n", index+1, len(candidate.Steps), step.Name, command)

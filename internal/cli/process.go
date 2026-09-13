@@ -1,3 +1,4 @@
+// process.go - Run AWS CLI commands with native streams, signals, and statuses
 package cli
 
 import (
@@ -10,20 +11,30 @@ import (
 )
 
 // runAWS starts exactly one AWS operation process after version validation.
-// Streams are attached directly rather than copied through scanners or buffers,
-// preserving binary data, terminal behavior, and AWS diagnostic formatting.
+// User-facing streams are attached directly, preserving binary data, terminal
+// behavior, and AWS diagnostic formatting. Internal probes may supply bounded
+// writers or nil for an operating-system null device.
 func runAWS(path string, arguments, environ []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	command := exec.Command(path, arguments...)
 	command.Env = environ
 	command.Stdin = stdin
-	command.Stdout = stdout
-	command.Stderr = stderr
+	// A nil os/exec stream is connected directly to the null device. Presence
+	// checks use that path so configured credential values never pass through
+	// aws-clip memory.
+	if stdout != nil {
+		command.Stdout = stdout
+	}
+	if stderr != nil {
+		command.Stderr = stderr
+	}
 
 	forwarded := make(chan os.Signal, 1)
 	signal.Notify(forwarded, forwardedSignals()...)
 	if err := command.Start(); err != nil {
 		signal.Stop(forwarded)
-		fmt.Fprintln(stderr, "aws-clip: AWS CLI could not be started")
+		if stderr != nil {
+			fmt.Fprintln(stderr, "aws-clip: AWS CLI could not be started")
+		}
 		return exitCannotRun
 	}
 
@@ -51,6 +62,8 @@ func runAWS(path string, arguments, environ []string, stdin io.Reader, stdout, s
 	if errors.As(err, &exitError) {
 		return processExitCode(exitError)
 	}
-	fmt.Fprintln(stderr, "aws-clip: AWS CLI process wait failed")
+	if stderr != nil {
+		fmt.Fprintln(stderr, "aws-clip: AWS CLI process wait failed")
+	}
 	return exitCannotRun
 }

@@ -1,3 +1,4 @@
+// config.go - Resolve aws-clip settings and validate local safety policy
 package cli
 
 import (
@@ -23,8 +24,11 @@ const defaultMaxWorkflowSteps = 20
 // deliberate exceptions and Deny can impose organization-specific blocks.
 // Deny always wins when more than one rule matches.
 type WorkflowPolicy struct {
-	Allow    []string
-	Deny     []string
+	// Allow names non-read operations permitted after all stronger guards pass
+	Allow []string
+	// Deny names operations that remain blocked even when another rule allows
+	Deny []string
+	// MaxSteps bounds workflow process count and review size
 	MaxSteps int
 }
 
@@ -39,28 +43,41 @@ type workflowPolicyFile struct {
 // zero timeout. This distinction is important: aws-clip must defer to AWS CLI
 // configuration unless an operator deliberately supplies a wrapper setting.
 type Settings struct {
-	AWSBinary      string
-	Profile        *string
-	Region         *string
-	RetryMode      *string
-	MaxAttempts    *int
+	// AWSBinary selects the AWS CLI v2 executable
+	AWSBinary string
+	// Profile is the explicit AWS profile used by lifecycle and execution commands
+	Profile *string
+	// Region overrides AWS profile and ambient Region selection when present
+	Region *string
+	// RetryMode delegates retry strategy to AWS CLI
+	RetryMode *string
+	// MaxAttempts delegates total request-attempt count to AWS CLI
+	MaxAttempts *int
+	// ConnectTimeout sets the AWS CLI socket connection timeout in seconds
 	ConnectTimeout *int
-	ReadTimeout    *int
+	// ReadTimeout sets the AWS CLI socket read timeout in seconds
+	ReadTimeout *int
+	// WorkflowPolicy contains file-owned controls for reviewed sequences
 	WorkflowPolicy WorkflowPolicy
+	// ProtectedProfiles binds high-risk profile names to their expected AWS
+	// accounts. The map is configuration-file-only so ambient variables and
+	// one-off flags cannot silently weaken an established production guard.
+	ProtectedProfiles map[string]string
 }
 
 // fileSettings mirrors the public JSON schema. Pointer fields preserve whether
 // a key was omitted, allowing environment variables and flags to override only
 // values that actually exist in a lower-precedence layer.
 type fileSettings struct {
-	AWSBinary      *string             `json:"aws_binary"`
-	Profile        *string             `json:"profile"`
-	Region         *string             `json:"region"`
-	RetryMode      *string             `json:"retry_mode"`
-	MaxAttempts    *int                `json:"max_attempts"`
-	ConnectTimeout *int                `json:"connect_timeout_seconds"`
-	ReadTimeout    *int                `json:"read_timeout_seconds"`
-	WorkflowPolicy *workflowPolicyFile `json:"workflow_policy"`
+	AWSBinary         *string             `json:"aws_binary"`
+	Profile           *string             `json:"profile"`
+	Region            *string             `json:"region"`
+	RetryMode         *string             `json:"retry_mode"`
+	MaxAttempts       *int                `json:"max_attempts"`
+	ConnectTimeout    *int                `json:"connect_timeout_seconds"`
+	ReadTimeout       *int                `json:"read_timeout_seconds"`
+	WorkflowPolicy    *workflowPolicyFile `json:"workflow_policy"`
+	ProtectedProfiles map[string]string   `json:"protected_profiles"`
 }
 
 // overrides contains values explicitly supplied as wrapper command flags.
@@ -246,6 +263,12 @@ func applyLayer(target *Settings, layer fileSettings) {
 			target.WorkflowPolicy.MaxSteps = *layer.WorkflowPolicy.MaxSteps
 		}
 	}
+	if layer.ProtectedProfiles != nil {
+		target.ProtectedProfiles = make(map[string]string, len(layer.ProtectedProfiles))
+		for profile, accountID := range layer.ProtectedProfiles {
+			target.ProtectedProfiles[profile] = accountID
+		}
+	}
 }
 
 func cloneString(value *string) *string {
@@ -304,7 +327,30 @@ func validateSettings(settings Settings) error {
 			return err
 		}
 	}
+	for profile, accountID := range settings.ProtectedProfiles {
+		if strings.TrimSpace(profile) == "" || !isPrintableSingleLine(profile) {
+			return errors.New("protected profile names must be non-empty, printable, and single-line")
+		}
+		if !isAWSAccountID(accountID) {
+			return fmt.Errorf("protected profile %q must use a 12-digit AWS account ID", profile)
+		}
+	}
 	return nil
+}
+
+// isAWSAccountID validates the fixed-width decimal identifier returned by AWS
+// STS and used by account guards. Keeping this check local avoids accepting an
+// ARN, alias, or malformed value as an account-bound approval token.
+func isAWSAccountID(value string) bool {
+	if len(value) != 12 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isPrintableSingleLine defines the text accepted for values that may appear in

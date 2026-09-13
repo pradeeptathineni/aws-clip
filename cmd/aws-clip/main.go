@@ -1,4 +1,5 @@
-// Command aws-clip provides previewable, policy-controlled workflows backed by
+// main.go - Provide the aws-clip process entry point
+// Command aws-clip provides guarded profile and session operations backed by
 // an installed AWS CLI v2.
 package main
 

@@ -1,3 +1,4 @@
+// workflow_test.go - Verify workflow validation, policy, planning, and execution
 package cli
 
 import (
@@ -83,7 +84,7 @@ func TestWorkflowPolicyRequiresExplicitWriteAllowanceAndDenyWins(t *testing.T) {
 		configPath := writeConfig(t, `{"workflow_policy":{"allow":["cloudformation:deploy"]}}`)
 		rt, stdout, stderr := testRuntime(t, false, nil)
 		status := run([]string{"--config", configPath, "plan", workflowPath}, rt)
-		if status != exitOK || stderr.Len() != 0 || !strings.Contains(stdout.String(), "matched configured allow rule") {
+		if status != exitOK || stderr.Len() != 0 || !strings.Contains(stdout.String(), "matched configured allow rule") || !strings.Contains(stdout.String(), "approval_required=true") {
 			t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 		}
 	})
@@ -118,7 +119,7 @@ func TestRunRequiresNamedApprovalAndExecutesAllowedStepsInOrder(t *testing.T) {
 
 	t.Run("approval must match", func(t *testing.T) {
 		rt, stdout, stderr := testRuntime(t, false, nil, "FAKE_CALL_LOG="+callLog)
-		status := run([]string{"--config", configPath, "--aws-binary", fake, "run", "--approve", "different", workflowPath}, rt)
+		status := run([]string{"--config", configPath, "--aws-binary", fake, "--profile", "operations", "run", "--approve", "different", workflowPath}, rt)
 		if status != exitUsage || stdout.Len() != 0 || !strings.Contains(stderr.String(), `--approve "release"`) {
 			t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 		}
@@ -133,12 +134,14 @@ func TestRunRequiresNamedApprovalAndExecutesAllowedStepsInOrder(t *testing.T) {
 			"FAKE_CALL_LOG="+approvedLog,
 			"FAKE_STDOUT=step output\n",
 		)
-		status := run([]string{"--config", configPath, "--aws-binary", fake, "run", workflowPath, "--approve", "release"}, rt)
+		status := run([]string{"--config", configPath, "--aws-binary", fake, "--profile", "operations", "run", workflowPath, "--approve", "release", "--approve-account", "123456789012"}, rt)
 		if status != exitOK {
 			t.Fatalf("status = %d, stderr = %q", status, stderr.String())
 		}
 		wantCalls := [][]string{
 			{"--version"},
+			fakeIdentityArguments(),
+			fakeProfileRegionArguments("operations"),
 			{"ec2", "describe-instances"},
 			{"cloudformation", "deploy", "--stack-name", "example"},
 		}
@@ -172,13 +175,32 @@ func TestRunStopsAfterFirstAWSFailureAndReturnsItsStatus(t *testing.T) {
 		"FAKE_EXIT_CODE=47",
 	)
 
-	status := run([]string{"--aws-binary", fake, "run", workflowPath, "--approve", "inspect"}, rt)
+	status := run([]string{"--aws-binary", fake, "--profile", "operations", "run", workflowPath, "--approve", "inspect"}, rt)
 	if status != 47 || !strings.Contains(stderr.String(), "remaining steps skipped") {
 		t.Fatalf("status = %d, stderr = %q", status, stderr.String())
 	}
-	wantCalls := [][]string{{"--version"}, {"sts", "get-caller-identity"}}
+	wantCalls := [][]string{{"--version"}, fakeIdentityArguments(), fakeProfileRegionArguments("operations"), {"sts", "get-caller-identity"}}
 	if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+	}
+}
+
+func TestWorkflowRunRequiresExplicitProfile(t *testing.T) {
+	fake := makeProcessAlias(t, "fake-aws")
+	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
+	workflowPath := writeWorkflow(t, `{
+  "schema_version": 1,
+  "name": "inspect",
+  "steps": [{"name": "regions", "command": ["ec2", "describe-regions"]}]
+}`)
+	rt, stdout, stderr := testRuntime(t, false, nil, "FAKE_CALL_LOG="+callLog)
+
+	status := run([]string{"--aws-binary", fake, "run", workflowPath, "--approve", "inspect"}, rt)
+	if status != exitUsage || stdout.Len() != 0 || !strings.Contains(stderr.String(), "explicit profile is required") {
+		t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(callLog); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("AWS CLI ran without an explicit profile: %v", err)
 	}
 }
 
