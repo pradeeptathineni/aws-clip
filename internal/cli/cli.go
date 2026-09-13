@@ -1,9 +1,7 @@
 // cli.go - Parse commands and coordinate AWS CLI-backed operations
 
-// Package cli implements aws-clip's profile lifecycle, identity guards,
-// workflows, command-line, and process boundaries
-// AWS service and credential
-// behavior deliberately remain in the installed AWS CLI v2
+// Package cli implements profile, session, workflow, and process controls
+// AWS service and credential behavior remains in the installed AWS CLI v2
 package cli
 
 import (
