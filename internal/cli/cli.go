@@ -1,7 +1,6 @@
-// Package cli implements aws-clip's command-line boundary and process runner.
-// AWS service behavior deliberately remains in the installed AWS CLI v2; this
-// package only resolves configuration, applies explicit execution controls, and
-// preserves the child process contract.
+// Package cli implements aws-clip's workflow, policy, command-line, and process
+// boundaries. AWS service behavior deliberately remains in the installed AWS
+// CLI v2 while this package provides local review and execution controls.
 package cli
 
 import (
@@ -20,6 +19,7 @@ import (
 const (
 	exitOK           = 0
 	exitUsage        = 2
+	exitPolicy       = 3
 	exitCannotRun    = 126
 	exitNotFound     = 127
 	versionOutputMax = 64 * 1024
@@ -68,6 +68,49 @@ func run(args []string, rt runtime) int {
 		fmt.Fprintf(rt.stderr, "aws-clip: configuration error: %s\n", printableLine(err.Error()))
 		return exitUsage
 	}
+	if request.command == "plan" || request.command == "run" {
+		candidate, err := readWorkflow(request.workflowPath, loaded.Settings.WorkflowPolicy.MaxSteps)
+		if err != nil {
+			fmt.Fprintf(rt.stderr, "aws-clip: workflow error: %s\n", printableLine(err.Error()))
+			return exitUsage
+		}
+		plan := buildWorkflowPlan(candidate, loaded.Settings)
+		if request.command == "plan" {
+			if request.format == "json" {
+				if err := writeWorkflowPlanJSON(rt.stdout, plan); err != nil {
+					fmt.Fprintln(rt.stderr, "aws-clip: could not write workflow plan")
+					return exitCannotRun
+				}
+			} else {
+				writeWorkflowPlanText(rt.stdout, plan)
+			}
+			if !plan.Allowed {
+				return exitPolicy
+			}
+			return exitOK
+		}
+		if !plan.Allowed {
+			writeWorkflowPlanText(rt.stderr, plan)
+			fmt.Fprintln(rt.stderr, "aws-clip: workflow blocked; update workflow_policy only after reviewing the denied operations")
+			return exitPolicy
+		}
+		if request.approval != candidate.Name {
+			fmt.Fprintf(rt.stderr, "aws-clip: run requires --approve %q to match the workflow name\n", printableLine(candidate.Name))
+			return exitUsage
+		}
+
+		path, err := resolveAWSBinary(loaded.Settings.AWSBinary)
+		if err != nil {
+			fmt.Fprintf(rt.stderr, "aws-clip: %s\n", printableLine(err.Error()))
+			return exitNotFound
+		}
+		childEnvironment := effectiveEnvironment(rt.environ, loaded.Settings, rt.interactive)
+		if _, err := inspectAWSVersion(path, childEnvironment); err != nil {
+			fmt.Fprintf(rt.stderr, "aws-clip: %s\n", printableLine(err.Error()))
+			return exitCannotRun
+		}
+		return runWorkflow(path, candidate, loaded.Settings, childEnvironment, rt)
+	}
 
 	path, err := resolveAWSBinary(loaded.Settings.AWSBinary)
 	if err != nil {
@@ -104,6 +147,11 @@ type request struct {
 	command      string
 	flags        overrides
 	awsArguments []string
+	workflowPath string
+	approval     string
+	format       string
+	approvalSet  bool
+	formatSet    bool
 	help         bool
 }
 
@@ -112,11 +160,11 @@ func parseArguments(args []string) (request, error) {
 	for index := 0; index < len(args); index++ {
 		argument := args[index]
 
-		if argument == "--help" || argument == "-h" || argument == "help" {
+		if argument == "--help" || argument == "-h" || (argument == "help" && result.command == "") {
 			result.help = true
 			return result, nil
 		}
-		if argument == "exec" || argument == "doctor" {
+		if argument == "exec" || argument == "doctor" || argument == "plan" || argument == "run" {
 			if result.command != "" {
 				return request{}, errors.New("exactly one command is required")
 			}
@@ -126,6 +174,9 @@ func parseArguments(args []string) (request, error) {
 		if argument == "--" {
 			if result.command != "exec" {
 				return request{}, errors.New("the -- separator is valid only after exec")
+			}
+			if result.approvalSet || result.formatSet {
+				return request{}, errors.New("--approve and --format are not valid with exec")
 			}
 			result.awsArguments = append([]string(nil), args[index+1:]...)
 			if len(result.awsArguments) == 0 {
@@ -146,29 +197,64 @@ func parseArguments(args []string) (request, error) {
 				}
 				value = args[index]
 			}
-			if err := setOption(&result.flags, name, value); err != nil {
-				return request{}, err
+			switch name {
+			case "--approve":
+				result.approval = value
+				result.approvalSet = true
+			case "--format":
+				result.format = value
+				result.formatSet = true
+			default:
+				if err := setOption(&result.flags, name, value); err != nil {
+					return request{}, err
+				}
 			}
 			continue
 		}
 		if result.command == "" {
-			return request{}, errors.New("expected exec or doctor")
+			return request{}, errors.New("expected plan, run, exec, or doctor")
+		}
+		if result.command == "plan" || result.command == "run" {
+			if result.workflowPath != "" {
+				return request{}, errors.New("plan and run accept exactly one workflow file")
+			}
+			result.workflowPath = argument
+			continue
 		}
 		return request{}, errors.New("wrapper options must precede the -- separator")
 	}
 
 	if result.command == "" {
-		return request{}, errors.New("expected exec or doctor")
+		return request{}, errors.New("expected plan, run, exec, or doctor")
 	}
 	if result.command == "exec" {
 		return request{}, errors.New("exec requires the -- separator")
+	}
+	if (result.command == "plan" || result.command == "run") && result.workflowPath == "" {
+		return request{}, fmt.Errorf("%s requires a workflow file", result.command)
+	}
+	if result.workflowPath != "" && !isPrintableSingleLine(result.workflowPath) {
+		return request{}, errors.New("workflow file path must be printable and single-line")
+	}
+	if result.command != "run" && result.approvalSet {
+		return request{}, errors.New("--approve is valid only with run")
+	}
+	if result.command == "plan" {
+		if !result.formatSet {
+			result.format = "text"
+		}
+		if result.format != "text" && result.format != "json" {
+			return request{}, errors.New("--format must be text or json")
+		}
+	} else if result.formatSet {
+		return request{}, errors.New("--format is valid only with plan")
 	}
 	return result, nil
 }
 
 func recognizedOption(name string) bool {
 	switch name {
-	case "--config", "--aws-binary", "--profile", "--region", "--retry-mode", "--max-attempts", "--connect-timeout", "--read-timeout":
+	case "--config", "--aws-binary", "--profile", "--region", "--retry-mode", "--max-attempts", "--connect-timeout", "--read-timeout", "--approve", "--format":
 		return true
 	default:
 		return false
@@ -364,6 +450,8 @@ func writeDoctor(output io.Writer, info awsInfo, loaded loadedSettings, interact
 	fmt.Fprintf(output, "max_attempts: %s\n", displayOptionalInt(loaded.Settings.MaxAttempts))
 	fmt.Fprintf(output, "connect_timeout_seconds: %s\n", displayOptionalInt(loaded.Settings.ConnectTimeout))
 	fmt.Fprintf(output, "read_timeout_seconds: %s\n", displayOptionalInt(loaded.Settings.ReadTimeout))
+	fmt.Fprintf(output, "workflow_policy: read-oriented default; %d allow rules; %d deny rules; max %d steps\n",
+		len(loaded.Settings.WorkflowPolicy.Allow), len(loaded.Settings.WorkflowPolicy.Deny), loaded.Settings.WorkflowPolicy.MaxSteps)
 	fmt.Fprintf(output, "stream_mode: %s\n", mode)
 }
 
@@ -394,6 +482,8 @@ func printableLine(value string) string {
 }
 
 const usageText = `Usage:
+  aws-clip [wrapper options] plan [--format text|json] <workflow.json>
+  aws-clip [wrapper options] run --approve NAME <workflow.json>
   aws-clip [wrapper options] exec [wrapper options] -- <aws arguments...>
   aws-clip [wrapper options] doctor
 
@@ -407,6 +497,11 @@ Wrapper options:
   --connect-timeout SECONDS Set the socket connection timeout (0 disables)
   --read-timeout SECONDS    Set the socket read timeout (0 disables)
 
-The -- separator is mandatory for exec. Every argument after it belongs to
-AWS CLI and is passed without shell parsing.
+Workflow options:
+  --format text|json         Select plan output; defaults to text
+  --approve NAME             Confirm the exact workflow name for run
+
+Plan validates a workflow and evaluates local policy without running AWS CLI.
+Run executes allowed steps in order and stops on the first failure. The --
+separator is mandatory for exec; arguments after it bypass workflow safeguards.
 `

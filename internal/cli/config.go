@@ -16,6 +16,24 @@ import (
 
 const configFileName = "config.json"
 
+const defaultMaxWorkflowSteps = 20
+
+// WorkflowPolicy defines the local guardrails applied to declarative
+// workflows. Read-oriented AWS operations are allowed by default; Allow adds
+// deliberate exceptions and Deny can impose organization-specific blocks.
+// Deny always wins when more than one rule matches.
+type WorkflowPolicy struct {
+	Allow    []string
+	Deny     []string
+	MaxSteps int
+}
+
+type workflowPolicyFile struct {
+	Allow    []string `json:"allow"`
+	Deny     []string `json:"deny"`
+	MaxSteps *int     `json:"max_steps"`
+}
+
 // Settings is the fully resolved wrapper configuration. Optional AWS settings
 // remain pointers so an absent value can be distinguished from an explicit
 // zero timeout. This distinction is important: aws-clip must defer to AWS CLI
@@ -28,19 +46,21 @@ type Settings struct {
 	MaxAttempts    *int
 	ConnectTimeout *int
 	ReadTimeout    *int
+	WorkflowPolicy WorkflowPolicy
 }
 
 // fileSettings mirrors the public JSON schema. Pointer fields preserve whether
 // a key was omitted, allowing environment variables and flags to override only
 // values that actually exist in a lower-precedence layer.
 type fileSettings struct {
-	AWSBinary      *string `json:"aws_binary"`
-	Profile        *string `json:"profile"`
-	Region         *string `json:"region"`
-	RetryMode      *string `json:"retry_mode"`
-	MaxAttempts    *int    `json:"max_attempts"`
-	ConnectTimeout *int    `json:"connect_timeout_seconds"`
-	ReadTimeout    *int    `json:"read_timeout_seconds"`
+	AWSBinary      *string             `json:"aws_binary"`
+	Profile        *string             `json:"profile"`
+	Region         *string             `json:"region"`
+	RetryMode      *string             `json:"retry_mode"`
+	MaxAttempts    *int                `json:"max_attempts"`
+	ConnectTimeout *int                `json:"connect_timeout_seconds"`
+	ReadTimeout    *int                `json:"read_timeout_seconds"`
+	WorkflowPolicy *workflowPolicyFile `json:"workflow_policy"`
 }
 
 // overrides contains values explicitly supplied as wrapper command flags.
@@ -64,7 +84,10 @@ func resolveSettings(flagValues overrides, environ []string, configDir func() (s
 	}
 
 	result := loadedSettings{
-		Settings:   Settings{AWSBinary: "aws"},
+		Settings: Settings{
+			AWSBinary:      "aws",
+			WorkflowPolicy: WorkflowPolicy{MaxSteps: defaultMaxWorkflowSteps},
+		},
 		ConfigPath: path,
 	}
 
@@ -213,6 +236,16 @@ func applyLayer(target *Settings, layer fileSettings) {
 	if layer.ReadTimeout != nil {
 		target.ReadTimeout = cloneInt(layer.ReadTimeout)
 	}
+	if layer.WorkflowPolicy != nil {
+		target.WorkflowPolicy = WorkflowPolicy{
+			Allow:    append([]string(nil), layer.WorkflowPolicy.Allow...),
+			Deny:     append([]string(nil), layer.WorkflowPolicy.Deny...),
+			MaxSteps: defaultMaxWorkflowSteps,
+		}
+		if layer.WorkflowPolicy.MaxSteps != nil {
+			target.WorkflowPolicy.MaxSteps = *layer.WorkflowPolicy.MaxSteps
+		}
+	}
 }
 
 func cloneString(value *string) *string {
@@ -259,6 +292,17 @@ func validateSettings(settings Settings) error {
 	}
 	if settings.ReadTimeout != nil && *settings.ReadTimeout < 0 {
 		return errors.New("read timeout must be 0 or greater")
+	}
+	if settings.WorkflowPolicy.MaxSteps < 1 || settings.WorkflowPolicy.MaxSteps > 100 {
+		return errors.New("workflow policy max_steps must be between 1 and 100")
+	}
+	if len(settings.WorkflowPolicy.Allow) > 100 || len(settings.WorkflowPolicy.Deny) > 100 {
+		return errors.New("workflow policy supports at most 100 allow and 100 deny rules")
+	}
+	for _, rule := range append(append([]string(nil), settings.WorkflowPolicy.Allow...), settings.WorkflowPolicy.Deny...) {
+		if err := validatePolicyRule(rule); err != nil {
+			return err
+		}
 	}
 	return nil
 }

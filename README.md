@@ -1,158 +1,276 @@
 # AWS CLI Plus
 
-`aws-clip` is a transparent execution wrapper for an installed AWS CLI v2. It
-keeps AWS service coverage, credentials, request serialization, output formats,
-and retries in the official CLI while adding an explicit wrapper boundary,
-predictable configuration, safer non-interactive behavior, and local
-diagnostics.
+AWS CLI Plus (`aws-clip`) turns an installed AWS CLI v2 into previewable,
+policy-controlled operational workflows. It is for work that should be
+repeatable and reviewable: inventory checks, release sequences, verification,
+and explicitly approved changes.
 
-## Requirements and installation
+It does not replace the AWS CLI. AWS CLI v2 still provides service coverage,
+credential resolution, request handling, retries, and output formatting.
+`aws-clip` adds a small local layer for reusable sequences, policy decisions,
+approval, fail-fast execution, and step-by-step visibility.
 
-- AWS CLI v2 available on `PATH`, or its executable path configured explicitly
-- Go 1.22 or newer to build from source
+Use `aws-clip` when a sequence should be checked and run the same way more than
+once. Use `aws` directly for ordinary exploration and one-off commands. The
+`aws-clip exec` command is a low-level compatibility escape hatch; it is useful
+when wrapper configuration is needed, but it intentionally bypasses workflow
+policy and approval.
 
-Build the executable locally:
+## Install
+
+Requirements:
+
+- AWS CLI v2 on `PATH`, or its executable path configured explicitly
+- Go 1.22 or newer when building from source
 
 ```sh
 make build
 ./bin/aws-clip doctor
 ```
 
-Or install it into the active Go binary directory:
+Or install into the active Go binary directory:
 
 ```sh
 go install ./cmd/aws-clip
 aws-clip doctor
 ```
 
-The wrapper checks the configured executable using `aws --version` and rejects
-AWS CLI v1. Version inspection is local and does not make an AWS API request.
+`doctor` performs a local `aws --version` check, rejects AWS CLI v1, and shows
+the effective non-secret context and workflow policy summary. It does not call
+an AWS API or inspect account identity.
 
-## Passing through AWS commands
+## Create, preview, and run a workflow
 
-Use `exec --` to separate wrapper options from AWS arguments:
+A workflow is a versioned JSON file containing named AWS CLI steps. Command
+arguments are arrays, so they are passed literally without a shell:
 
-```sh
-aws-clip exec -- sts get-caller-identity
-aws-clip --profile production --region us-east-1 exec -- ec2 describe-instances --output json
-aws-clip exec -- s3 cp "release notes.txt" "s3://example-bucket/releases/release notes.txt"
+```json
+{
+  "schema_version": 1,
+  "name": "release-check",
+  "description": "Confirm identity and inspect the deployed stack",
+  "steps": [
+    {
+      "name": "identity",
+      "description": "Confirm which caller will perform later work",
+      "command": ["sts", "get-caller-identity"]
+    },
+    {
+      "name": "stack",
+      "description": "Read the current application stack",
+      "command": [
+        "cloudformation",
+        "describe-stacks",
+        "--stack-name",
+        "application",
+        "--output",
+        "json"
+      ]
+    }
+  ]
+}
 ```
 
-The separator is mandatory. Every value after it is passed as a distinct
-argument without shell evaluation, interpolation, or re-tokenization. Quote
-values for your shell exactly as you would when invoking `aws` directly.
+The schema is strict: unknown fields and trailing JSON are rejected. Names and
+descriptions must be printable single-line text; step names must be unique; and
+each command must begin with a lowercase service and operation. Files are
+limited to 1 MiB, each step to 256 arguments and 64 KiB of argument data, and
+the policy controls the maximum number of steps. Use AWS `file://` or `fileb://`
+parameters for larger request documents.
 
-Before each operation, `aws-clip` runs a captured `--version` check. It then
-starts exactly one AWS operation process. In normal use, the child inherits
-stdin, stdout, and stderr directly, and its exit status is returned unchanged.
-Common termination signals are forwarded; on POSIX systems a signal-terminated
-child is reported using the conventional `128 + signal` status.
+Preview it first. Planning reads configuration and the workflow, evaluates
+policy, and makes no AWS CLI or AWS API call:
 
-When any standard stream is not a terminal, the wrapper sets `AWS_PAGER` to an
-empty value and `AWS_CLI_AUTO_PROMPT=off`. This prevents a pager or interactive
-prompt from blocking automation. The wrapper itself writes nothing to stdout
-during `exec`, so stdout remains exclusively AWS CLI output. Interactive runs
-leave both AWS settings untouched.
+```sh
+aws-clip --profile production --region us-east-1 plan release-check.json
+```
 
-## Configuration
+The preview shows the effective profile, Region, retry and timeout settings,
+step descriptions, `service:operation` identifiers, and each policy decision.
+It deliberately does not print argument values, which may contain sensitive
+request data. For a stable machine-readable preview, use:
 
-Configuration precedence is deterministic, from highest to lowest:
+```sh
+aws-clip plan --format json release-check.json
+```
 
-1. Wrapper command flags before `--`
-2. `AWS_CLIP_*` environment variables
-3. The user configuration file
-4. Wrapper defaults
+The JSON contract contains `schema_version`, workflow identity, effective
+`context`, and the overall `allowed` result. Each ordered step contains
+`index`, `name`, optional `description`, `command`, `additional_arguments`,
+`decision`, and `reason`. Unset context settings are `null`, optional
+descriptions are omitted, and argument values are never part of this output.
 
-Only the AWS executable has a wrapper default (`aws`). Every other unset value
-is omitted so the AWS CLI can apply its normal command-line, environment,
-profile, and built-in behavior.
+After reviewing the plan, run it by typing the exact workflow name:
 
-| Wrapper flag | Environment variable | JSON key | Effect |
-| --- | --- | --- | --- |
-| `--aws-binary PATH` | `AWS_CLIP_AWS_BINARY` | `aws_binary` | AWS CLI v2 executable; defaults to `aws` |
-| `--profile NAME` | `AWS_CLIP_PROFILE` | `profile` | Sets `AWS_PROFILE` for the child |
-| `--region REGION` | `AWS_CLIP_REGION` | `region` | Sets `AWS_REGION` for the child |
-| `--retry-mode MODE` | `AWS_CLIP_RETRY_MODE` | `retry_mode` | Sets `AWS_RETRY_MODE`; accepts `legacy`, `standard`, or `adaptive` |
-| `--max-attempts NUMBER` | `AWS_CLIP_MAX_ATTEMPTS` | `max_attempts` | Sets `AWS_MAX_ATTEMPTS`; the initial request counts as an attempt |
-| `--connect-timeout SECONDS` | `AWS_CLIP_CONNECT_TIMEOUT` | `connect_timeout_seconds` | Prepends the AWS global `--cli-connect-timeout` option; `0` disables it |
-| `--read-timeout SECONDS` | `AWS_CLIP_READ_TIMEOUT` | `read_timeout_seconds` | Prepends the AWS global `--cli-read-timeout` option; `0` disables it |
+```sh
+aws-clip --profile production --region us-east-1 \
+  run release-check.json --approve release-check
+```
 
-Text and path values must contain only printable, single-line characters.
-Control characters are rejected before the AWS CLI starts so diagnostics
-cannot be split or altered by terminal control sequences.
+`run` validates the complete workflow and policy before it checks AWS CLI v2 or
+starts a step. It then executes steps in file order, writes lifecycle messages
+to stderr, leaves AWS stdout and stderr attached, and stops at the first failed
+step. The failing AWS CLI status is returned unchanged. There is no implicit
+retry around a step; AWS CLI retry configuration remains authoritative.
 
-The default file is `aws-clip/config.json` beneath the platform user
-configuration directory:
+Every workflow run requires named approval, including read-only workflows.
+This makes an unattended run deliberate as well: the caller must include the
+reviewed workflow name in its invocation.
+
+## Workflow policy
+
+By default, workflows allow operations whose AWS CLI operation begins with a
+read-oriented name such as `describe-`, `get-`, `head-`, `list-`, `lookup-`,
+`search-`, or `validate-`, plus common read commands including `ls`, `scan`,
+`select`, `tail`, and `wait`. Known credential-, token-, and secret-returning
+operations require an explicit allow rule even when their name looks read-only.
+Other operations are also blocked until configuration allows them. This
+conservative name-based rule is a local safeguard, not a substitute for IAM
+authorization or AWS Organizations controls.
+
+Add narrowly scoped exceptions and local blocks in the user configuration:
+
+```json
+{
+  "profile": "operations",
+  "region": "us-east-1",
+  "retry_mode": "standard",
+  "max_attempts": 3,
+  "workflow_policy": {
+    "allow": [
+      "cloudformation:deploy",
+      "s3api:put-object"
+    ],
+    "deny": [
+      "*:delete-*",
+      "ec2:terminate-*"
+    ],
+    "max_steps": 20
+  }
+}
+```
+
+Rules match the lowercase `service:operation` at the beginning of each step.
+`*` is the only wildcard and can match any number of characters. A deny match
+always wins over the read-oriented default and configured allow rules. Policy
+supports at most 100 allow and 100 deny rules, and `max_steps` must be from 1
+through 100. When omitted, the workflow limit is 20 steps.
+
+Changing operations therefore require two separate decisions: a persistent
+allow rule and the exact `--approve` value for a run. Destructive operations
+can also be denied broadly even if another allow pattern would match.
+
+## Configuration and precedence
+
+The default configuration file is `aws-clip/config.json` beneath the platform
+user configuration directory:
 
 - Linux and other Unix systems: `$XDG_CONFIG_HOME`, or `$HOME/.config`
 - macOS: `$HOME/Library/Application Support`
 - Windows: `%AppData%`
 
-Select another file with `--config PATH` or `AWS_CLIP_CONFIG_FILE`. Unlike the
-optional default file, an explicitly selected file must exist and be valid.
-Unknown JSON keys and trailing data are rejected to catch configuration errors.
+Select another file with `--config PATH` or `AWS_CLIP_CONFIG_FILE`. The optional
+default file may be absent; an explicitly selected file must exist. JSON keys
+are strict, and unknown keys or trailing data are errors.
 
-Example configuration:
+Runtime settings use this precedence, from highest to lowest:
 
-```json
-{
-  "aws_binary": "/usr/local/bin/aws",
-  "profile": "operations",
-  "region": "us-east-1",
-  "retry_mode": "standard",
-  "max_attempts": 3,
-  "connect_timeout_seconds": 10,
-  "read_timeout_seconds": 60
-}
-```
+1. Wrapper flags
+2. `AWS_CLIP_*` environment variables
+3. The user configuration file
+4. Wrapper defaults
 
-These settings contain no credentials. Existing AWS credential environment
-variables, shared files, IAM roles, IAM Identity Center sessions, and other AWS
-providers pass through unchanged. `aws-clip` does not read or persist credential
-values.
+| Wrapper flag | Environment variable | JSON key | Effect |
+| --- | --- | --- | --- |
+| `--aws-binary PATH` | `AWS_CLIP_AWS_BINARY` | `aws_binary` | AWS CLI v2 executable; default `aws` |
+| `--profile NAME` | `AWS_CLIP_PROFILE` | `profile` | Sets `AWS_PROFILE` for AWS CLI |
+| `--region REGION` | `AWS_CLIP_REGION` | `region` | Sets `AWS_REGION` for AWS CLI |
+| `--retry-mode MODE` | `AWS_CLIP_RETRY_MODE` | `retry_mode` | Sets `AWS_RETRY_MODE`: `legacy`, `standard`, or `adaptive` |
+| `--max-attempts NUMBER` | `AWS_CLIP_MAX_ATTEMPTS` | `max_attempts` | Sets `AWS_MAX_ATTEMPTS`; the initial request counts |
+| `--connect-timeout SECONDS` | `AWS_CLIP_CONNECT_TIMEOUT` | `connect_timeout_seconds` | Adds AWS `--cli-connect-timeout`; `0` disables it |
+| `--read-timeout SECONDS` | `AWS_CLIP_READ_TIMEOUT` | `read_timeout_seconds` | Adds AWS `--cli-read-timeout`; `0` disables it |
 
-## Doctor
+Workflow policy is configuration-file-only so an ambient environment variable
+or ad hoc flag cannot weaken it. `--config` still selects the complete policy,
+so automation should pin and protect the intended configuration file.
 
-Run a local readiness check with:
+Unset runtime settings are omitted, allowing AWS CLI command-line,
+environment, profile, and built-in precedence to work normally. Text and path
+settings that may appear in diagnostics must be printable and single-line.
+
+## Safety and credential boundary
+
+`aws-clip` does not inspect or persist credential values, and it never copies
+AWS command argument values into plans or its own diagnostics. Existing AWS
+credential environment variables, shared configuration, IAM roles, IAM
+Identity Center sessions, credential processes, and other AWS providers pass
+to AWS CLI unchanged. Profile and Region selection affect AWS CLI in the normal
+way; a plan does not prove an account identity or permission set.
+
+Do not put credentials or secret literals in workflow files. AWS CLI output is
+not captured or rewritten and can itself contain sensitive service data, so
+protect workflow output as you would direct `aws` output. Workflow descriptions
+and names are shown in plans and execution messages.
+
+When any standard stream is not a terminal, `aws-clip` sets `AWS_PAGER` to an
+empty value and `AWS_CLI_AUTO_PROMPT=off`. This prevents a pager or prompt from
+blocking automation. Interactive runs leave both settings untouched.
+
+## Raw compatibility execution
+
+`exec` applies the same resolved profile, Region, retry, timeout, AWS CLI v2,
+stream, and exit-status behavior to one arbitrary AWS command:
 
 ```sh
-aws-clip doctor
+aws-clip --profile production exec -- ec2 describe-instances --output json
+aws-clip exec -- s3 cp "release notes.txt" "s3://example/releases/release notes.txt"
 ```
 
-`doctor` reports the resolved executable, parsed AWS CLI version, configuration
-file state, effective non-secret wrapper settings, and stream mode. It does not
-call STS or any other AWS API, inspect account identity, or print credential
-values. Missing executables, AWS CLI v1, and unrecognized version output produce
-an actionable error and a nonzero status.
+The `--` separator is mandatory. Everything after it is a distinct AWS CLI
+argument and is never evaluated or re-tokenized by a shell. `exec` does not
+apply workflow policy, named approval, sequencing, or plan output. Prefer
+direct `aws` when these wrapper settings add no value; prefer `plan` and `run`
+when safeguards and repeatability matter.
 
 ## Exit statuses
 
 | Status | Meaning |
 | --- | --- |
-| AWS CLI status | The operation started; its status is returned unchanged |
-| `2` | Invalid wrapper syntax or configuration |
-| `126` | The configured executable exists but cannot be validated or started |
-| `127` | The AWS CLI executable could not be found |
+| `0` | Local check, plan, or all workflow steps succeeded |
+| AWS CLI status | An `exec` operation or workflow step started and failed; its status is unchanged |
+| `2` | Invalid syntax, configuration, approval, or workflow file |
+| `3` | Workflow policy blocked one or more steps |
+| `126` | AWS CLI exists but cannot be validated or started, or plan output failed |
+| `127` | AWS CLI executable was not found |
 
-AWS diagnostics are not reformatted or hidden. For automation, choose an AWS
-machine-readable format explicitly, for example `--output json`; the wrapper
-does not silently change output format or query behavior.
+AWS diagnostics are not hidden or reformatted. For composable AWS output,
+choose an AWS machine format explicitly, such as `--output json`, and remember
+that a multi-step run writes each step's output to the same stdout stream.
+
+## Current limitations
+
+- Workflows are sequential JSON files. They do not provide variables,
+  conditionals, concurrency, output chaining, rollback, or remote orchestration.
+- Policy identifies the first two command entries as `service:operation`; AWS
+  global options cannot precede them in a workflow step.
+- The read-oriented default is based on operation names. IAM and organization
+  policy remain the authoritative security boundary.
+- Plan output omits argument values. Review the protected workflow file itself
+  when target-level detail is required.
+- `exec` is an explicit policy bypass and should not be used as the primary
+  interface for controlled automation.
 
 ## Troubleshooting
 
-- **`AWS CLI executable not found`**: install AWS CLI v2, add it to `PATH`, or
-  use `--aws-binary`/`AWS_CLIP_AWS_BINARY`.
-- **`AWS CLI v1 is not supported`**: upgrade to v2 and ensure the selected path
-  is the v2 installation.
-- **Version check failed**: run the configured executable with `--version` and
-  confirm it exits successfully with standard `aws-cli/2...` version output.
-- **Configuration error**: validate that the file is one JSON object, contains
-  only documented keys, uses integer timeout/attempt values, and uses a listed
-  retry mode.
-- **Unexpected AWS result or authentication failure**: run `aws-clip doctor` to
-  confirm non-secret context, then use the AWS CLI's normal configuration and
-  diagnostic facilities. The wrapper deliberately leaves credential resolution
-  and service errors to AWS CLI.
+- **Workflow blocked**: inspect `plan`, then narrow the operation or add the
+  smallest justified allow rule. Check deny rules first because they win.
+- **Approval rejected**: pass `--approve` followed by the exact workflow
+  `name`; values are case-sensitive.
+- **AWS CLI executable not found**: install AWS CLI v2, add it to `PATH`, or
+  configure `--aws-binary`/`AWS_CLIP_AWS_BINARY`.
+- **AWS CLI v1 is not supported**: upgrade to v2 and check the selected binary.
+- **Authentication or service failure**: use `doctor` for non-secret context,
+  then use AWS CLI's normal diagnostic and credential facilities.
 
 ## Development
 
@@ -160,6 +278,6 @@ does not silently change output format or query behavior.
 make check
 ```
 
-The check target verifies formatting, runs static analysis, and executes the
-hermetic process-level test suite. Tests use a local fake executable and do not
+The check target verifies formatting, runs static analysis, and executes a
+hermetic process-level suite. Tests use a local fake executable and do not
 contact AWS.

@@ -1,4 +1,5 @@
-// Command aws-clip provides a transparent execution boundary around AWS CLI v2.
+// Command aws-clip provides previewable, policy-controlled workflows backed by
+// an installed AWS CLI v2.
 package main
 
 import (
