@@ -267,6 +267,8 @@ func isSensitiveOutputOperation(command string) bool {
 	for _, pattern := range []string{
 		"codeartifact:get-authorization-token",
 		"cognito-identity:get-credentials-for-identity",
+		"cognito-identity:get-open-id-token*",
+		"ecr:get-authorization-token",
 		"ecr:get-login-password",
 		"eks:get-token",
 		"secretsmanager:*get-secret-value",

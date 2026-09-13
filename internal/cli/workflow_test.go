@@ -264,10 +264,21 @@ func TestWildcardMatchUsesOnlyAsteriskSemantics(t *testing.T) {
 }
 
 func TestSensitiveOutputOperationsRequireExplicitAllowance(t *testing.T) {
-	command := "secretsmanager:batch-get-secret-value"
-	if allowed, reason := evaluateWorkflowCommand(command, WorkflowPolicy{}); allowed || !strings.Contains(reason, "sensitive-output") {
-		t.Fatalf("default decision = allowed %t, reason %q", allowed, reason)
+	commands := []string{
+		"cognito-identity:get-open-id-token",
+		"cognito-identity:get-open-id-token-for-developer-identity",
+		"ecr:get-authorization-token",
+		"secretsmanager:batch-get-secret-value",
 	}
+	for _, command := range commands {
+		t.Run(command, func(t *testing.T) {
+			if allowed, reason := evaluateWorkflowCommand(command, WorkflowPolicy{}); allowed || !strings.Contains(reason, "sensitive-output") {
+				t.Fatalf("default decision = allowed %t, reason %q", allowed, reason)
+			}
+		})
+	}
+
+	command := "secretsmanager:batch-get-secret-value"
 	policy := WorkflowPolicy{Allow: []string{"secretsmanager:batch-get-secret-value"}}
 	if allowed, reason := evaluateWorkflowCommand(command, policy); !allowed || reason != "matched configured allow rule" {
 		t.Fatalf("configured decision = allowed %t, reason %q", allowed, reason)
