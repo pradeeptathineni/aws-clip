@@ -1,5 +1,7 @@
 //go:build darwin || dragonfly || freebsd || netbsd || openbsd
 
+// terminal_bsd.go - Detect interactive terminals on BSD-family systems
+
 package cli
 
 import (
@@ -8,9 +10,9 @@ import (
 	"unsafe"
 )
 
-// BSD-family systems expose terminal attributes through TIOCGETA. A successful
-// ioctl distinguishes a real terminal from other character devices without
-// reading from or otherwise disturbing the stream.
+// isTerminal probes terminal attributes without consuming stream data
+// BSD-family systems expose terminal attributes through TIOCGETA
+// a successful ioctl distinguishes a real terminal from other character devices
 func isTerminal(file *os.File) bool {
 	var attributes syscall.Termios
 	_, _, errno := syscall.Syscall6(

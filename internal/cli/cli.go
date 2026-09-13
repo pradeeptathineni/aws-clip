@@ -1,7 +1,9 @@
 // cli.go - Parse commands and coordinate AWS CLI-backed operations
+
 // Package cli implements aws-clip's profile lifecycle, identity guards,
-// workflows, command-line, and process boundaries. AWS service and credential
-// behavior deliberately remain in the installed AWS CLI v2.
+// workflows, command-line, and process boundaries
+// AWS service and credential
+// behavior deliberately remain in the installed AWS CLI v2
 package cli
 
 import (
@@ -17,6 +19,9 @@ import (
 	"strings"
 )
 
+// Stable wrapper statuses kept distinct from native AWS CLI failures
+// exitPolicy identifies a deliberate local safety refusal
+// versionOutputMax bounds diagnostics from executable validation
 const (
 	exitOK           = 0
 	exitUsage        = 2
@@ -26,11 +31,13 @@ const (
 	versionOutputMax = 64 * 1024
 )
 
+// awsVersionPattern accepts the documented leading AWS CLI version token
+// anchoring prevents unrelated executables from passing with embedded text
 var awsVersionPattern = regexp.MustCompile(`^(aws-cli/([0-9]+)(?:\.[0-9A-Za-z_-]+)+)(?:[[:space:]]|$)`)
 
-// runtime contains the operating-system boundaries used by the application.
+// runtime contains the operating-system boundaries used by the application
 // Keeping these values together makes configuration and TTY behavior testable
-// without changing how production child processes inherit their streams.
+// without changing how production child processes inherit their streams
 type runtime struct {
 	stdin         io.Reader
 	stdout        io.Writer
@@ -40,8 +47,9 @@ type runtime struct {
 	userConfigDir func() (string, error)
 }
 
-// Main runs one aws-clip command and returns the status that the entry point
-// should expose to its caller. AWS exit statuses are returned unchanged.
+// Main runs one aws-clip command using args without the executable name
+// stdin, stdout, and stderr remain attached to child AWS CLI operations
+// returns wrapper statuses for local failures and native AWS CLI statuses otherwise
 func Main(args []string, stdin *os.File, stdout, stderr *os.File) int {
 	return run(args, runtime{
 		stdin:         stdin,
@@ -53,6 +61,8 @@ func Main(args []string, stdin *os.File, stdout, stderr *os.File) int {
 	})
 }
 
+// run coordinates parsing, configuration, safety preflights, and dispatch
+// validates workflows and named approval before resolving or starting AWS CLI
 func run(args []string, rt runtime) int {
 	request, err := parseArguments(args)
 	if err != nil {
@@ -74,6 +84,7 @@ func run(args []string, rt runtime) int {
 		return exitUsage
 	}
 	if request.command == "plan" || request.command == "run" {
+		// Planning remains local and useful even when AWS CLI is unavailable
 		candidate, err := readWorkflow(request.workflowPath, loaded.Settings.WorkflowPolicy.MaxSteps)
 		if err != nil {
 			fmt.Fprintf(rt.stderr, "aws-clip: workflow error: %s\n", printableLine(err.Error()))
@@ -99,6 +110,8 @@ func run(args []string, rt runtime) int {
 			fmt.Fprintln(rt.stderr, "aws-clip: workflow blocked; update workflow_policy only after reviewing the denied operations")
 			return exitPolicy
 		}
+		// Named approval binds execution to the reviewed workflow document
+		// account approval remains separate until STS establishes the effective account
 		if request.approval != candidate.Name {
 			fmt.Fprintf(rt.stderr, "aws-clip: run requires --approve %q to match the workflow name\n", printableLine(candidate.Name))
 			return exitUsage
@@ -118,6 +131,7 @@ func run(args []string, rt runtime) int {
 		for _, step := range candidate.Steps {
 			commands = append(commands, classifyExecutionCommand(step.Command))
 		}
+		// One risky step guards the whole sequence before any workflow operation starts
 		if _, status := prepareProfileExecution(path, loaded.Settings, childEnvironment, rt, commands, request.approvalAccount); status != exitOK {
 			return status
 		}
@@ -154,16 +168,16 @@ func run(args []string, rt runtime) int {
 	case "exec":
 		return runProfileExec(path, request.awsArguments, loaded.Settings, childEnvironment, request.approvalAccount, rt)
 	default:
-		// parseArguments owns command validation. Keep this guard so a future
-		// parser change fails closed instead of accidentally executing AWS.
+		// parseArguments owns command validation
+		// Keep this guard so a future parser change fails closed instead of executing AWS
 		fmt.Fprintln(rt.stderr, "aws-clip: internal command validation error")
 		return exitUsage
 	}
 }
 
 // requiresExplicitProfile identifies commands whose value depends on proving
-// one named profile's identity. Discovery, planning, and an unscoped doctor
-// remain useful before an operator has selected a profile.
+// one named profile's identity
+// Discovery, planning, and an unscoped doctor remain useful before selection
 func requiresExplicitProfile(command string) bool {
 	switch command {
 	case "login", "logout", "context", "exec", "run":
@@ -173,6 +187,8 @@ func requiresExplicitProfile(command string) bool {
 	}
 }
 
+// request captures syntax-level intent before configuration precedence applies
+// set markers distinguish an absent command option from an explicitly empty value
 type request struct {
 	command            string
 	flags              overrides
@@ -187,6 +203,8 @@ type request struct {
 	help               bool
 }
 
+// parseArguments validates wrapper syntax without inspecting configuration or AWS
+// values after the exec separator remain literal and end wrapper option parsing
 func parseArguments(args []string) (request, error) {
 	var result request
 	for index := 0; index < len(args); index++ {
@@ -210,6 +228,8 @@ func parseArguments(args []string) (request, error) {
 			if result.approvalSet || result.formatSet {
 				return request{}, errors.New("--approve and --format are not valid with exec")
 			}
+			// Stop wrapper parsing permanently at the explicit trust boundary
+			// even flag-looking values after this point remain AWS arguments
 			result.awsArguments = append([]string(nil), args[index+1:]...)
 			if len(result.awsArguments) == 0 {
 				return request{}, errors.New("exec requires at least one AWS argument after --")
@@ -217,6 +237,8 @@ func parseArguments(args []string) (request, error) {
 			return result, nil
 		}
 		if strings.HasPrefix(argument, "-") {
+			// Recognize wrapper options before consuming a following value
+			// prevents unknown options from shifting the remaining parse
 			name, inlineValue, hasInlineValue := strings.Cut(argument, "=")
 			if !recognizedOption(name) {
 				return request{}, errors.New("unknown wrapper option")
@@ -290,8 +312,8 @@ func parseArguments(args []string) (request, error) {
 	return result, nil
 }
 
-// isCommand centralizes public command recognition so parsing and usage errors
-// cannot drift as the profile/session surface evolves.
+// isCommand centralizes public command recognition
+// keeps dispatch and usage errors aligned as the command surface evolves
 func isCommand(value string) bool {
 	switch value {
 	case "profiles", "login", "logout", "context", "exec", "doctor", "plan", "run":
@@ -301,6 +323,8 @@ func isCommand(value string) bool {
 	}
 }
 
+// recognizedOption limits parsing to wrapper-owned flags
+// unknown flags fail before any value can be mistaken for an AWS argument
 func recognizedOption(name string) bool {
 	switch name {
 	case "--config", "--aws-binary", "--profile", "--region", "--retry-mode", "--max-attempts", "--connect-timeout", "--read-timeout", "--approve", "--approve-account", "--format":
@@ -310,6 +334,8 @@ func recognizedOption(name string) bool {
 	}
 }
 
+// setOption records a validated wrapper flag in the highest-precedence layer
+// string copies keep returned pointers independent of parser temporaries
 func setOption(target *overrides, name, value string) error {
 	valueCopy := value
 	switch name {
@@ -345,25 +371,30 @@ func setOption(target *overrides, name, value string) error {
 	return nil
 }
 
+// parseFlagInteger parses numeric wrapper flags without reflecting values on error
 func parseFlagInteger(name, value string) (int, error) {
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		// Avoid reflecting a possibly sensitive argument value into diagnostics.
+		// Avoid reflecting a possibly sensitive argument value into diagnostics
 		return 0, fmt.Errorf("%s requires an integer", name)
 	}
 	return parsed, nil
 }
 
+// awsInfo records only the executable facts safe for doctor output
 type awsInfo struct {
 	path    string
 	version string
 }
 
+// Sentinel errors let callers distinguish unsupported and unverifiable binaries
 var (
 	errAWSV1             = errors.New("AWS CLI v1 is not supported")
 	errUnverifiedVersion = errors.New("AWS CLI version could not be verified")
 )
 
+// resolveAWSBinary follows normal PATH semantics and prefers an absolute result
+// falls back to the resolved relative path only when absolute conversion fails
 func resolveAWSBinary(configured string) (string, error) {
 	path, err := exec.LookPath(configured)
 	if err != nil {
@@ -376,14 +407,16 @@ func resolveAWSBinary(configured string) (string, error) {
 	return absolute, nil
 }
 
+// inspectAWSVersion runs the configured executable and requires an AWS CLI v2 token
+// captures a bounded combined stream because AWS versions may write to either stream
 func inspectAWSVersion(path string, environ []string) (awsInfo, error) {
 	var output bytes.Buffer
 	captured := &limitedWriter{writer: &output, remaining: versionOutputMax}
 	command := exec.Command(path, "--version")
 	command.Env = environ
-	// Use the same comparable writer for both streams. os/exec then serializes
-	// calls to Write, avoiding a data race in bytes.Buffer while retaining one
-	// combined bound for unexpectedly noisy or misconfigured executables.
+	// A shared comparable writer lets os/exec serialize Write calls
+	// avoids a data race in bytes.Buffer while retaining one
+	// combined bound for unexpectedly noisy or misconfigured executables
 	command.Stdout = captured
 	command.Stderr = captured
 	if err := command.Run(); err != nil {
@@ -400,14 +433,16 @@ func inspectAWSVersion(path string, environ []string) (awsInfo, error) {
 	return awsInfo{path: path, version: string(match[1])}, nil
 }
 
-// limitedWriter accepts every byte while retaining only a bounded prefix. The
+// limitedWriter accepts every byte while retaining only a bounded prefix
 // version subprocess therefore cannot grow wrapper memory without limit, and it
-// cannot block because a diagnostic exceeded the retained capacity.
+// cannot block because a diagnostic exceeded the retained capacity
 type limitedWriter struct {
 	writer    io.Writer
 	remaining int
 }
 
+// Write reports the full input length after retaining as much as capacity permits
+// preserves io.Writer progress semantics after the retained prefix is full
 func (writer *limitedWriter) Write(data []byte) (int, error) {
 	originalLength := len(data)
 	if writer.remaining > 0 {
@@ -424,10 +459,12 @@ func (writer *limitedWriter) Write(data []byte) (int, error) {
 	return originalLength, nil
 }
 
+// effectiveEnvironment builds the exact environment inherited by AWS CLI
+// preserves credential-provider variables while removing wrapper-only controls
 func effectiveEnvironment(base []string, settings Settings, interactive bool) []string {
-	// Wrapper-only variables are not meaningful to AWS CLI and are removed from
-	// its environment. Existing AWS credential-provider variables are preserved
-	// verbatim and credential resolution remains entirely AWS CLI's concern.
+	// Wrapper-only variables are not meaningful to AWS CLI and are removed
+	// Existing AWS credential-provider variables are preserved
+	// verbatim and credential resolution remains entirely AWS CLI's concern
 	environment := make([]string, 0, len(base)+6)
 	for _, entry := range base {
 		key, _, found := strings.Cut(entry, "=")
@@ -456,6 +493,8 @@ func effectiveEnvironment(base []string, settings Settings, interactive bool) []
 	return environment
 }
 
+// setEnvironment replaces every spelling of a variable with one final value
+// case-insensitive removal matches Windows environment lookup semantics
 func setEnvironment(environ []string, name, value string) []string {
 	result := make([]string, 0, len(environ)+1)
 	for _, entry := range environ {
@@ -468,6 +507,8 @@ func setEnvironment(environ []string, name, value string) []string {
 	return append(result, name+"="+value)
 }
 
+// effectiveArguments prepends only explicitly configured AWS global timeouts
+// leaving absent settings out delegates their defaults to AWS CLI
 func effectiveArguments(original []string, settings Settings) []string {
 	arguments := make([]string, 0, len(original)+4)
 	if settings.ConnectTimeout != nil {
@@ -479,6 +520,8 @@ func effectiveArguments(original []string, settings Settings) []string {
 	return append(arguments, original...)
 }
 
+// writeDoctor emits local configuration facts as stable line-oriented diagnostics
+// printableLine protects record boundaries for operating-system-derived values
 func writeDoctor(output io.Writer, info awsInfo, loaded loadedSettings, interactive bool) {
 	mode := "non-interactive"
 	if interactive {
@@ -505,6 +548,7 @@ func writeDoctor(output io.Writer, info awsInfo, loaded loadedSettings, interact
 	fmt.Fprintf(output, "stream_mode: %s\n", mode)
 }
 
+// displayOptionalString labels absence as deliberate delegation to AWS CLI
 func displayOptionalString(value *string) string {
 	if value == nil {
 		return "aws-cli default"
@@ -512,6 +556,7 @@ func displayOptionalString(value *string) string {
 	return *value
 }
 
+// displayOptionalInt labels absence as deliberate delegation to AWS CLI
 func displayOptionalInt(value *int) string {
 	if value == nil {
 		return "aws-cli default"
@@ -521,8 +566,8 @@ func displayOptionalInt(value *int) string {
 
 // printableLine keeps diagnostic records structurally trustworthy even when a
 // path obtained from the operating system contains bytes that configuration
-// validation never saw (for example, an unusual current working directory).
-// Valid configured values are already printable and remain unchanged.
+// validation never saw such as an unusual current working directory
+// Valid configured values remain unchanged
 func printableLine(value string) string {
 	if isPrintableSingleLine(value) {
 		return value
@@ -531,6 +576,7 @@ func printableLine(value string) string {
 	return quoted[1 : len(quoted)-1]
 }
 
+// usageText is the single command and option reference used by help and errors
 const usageText = `Usage:
   aws-clip [wrapper options] profiles [--format text|json]
   aws-clip [wrapper options] login

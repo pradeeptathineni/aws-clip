@@ -1,5 +1,7 @@
 //go:build linux
 
+// terminal_linux.go - Detect interactive terminals on Linux
+
 package cli
 
 import (
@@ -8,9 +10,9 @@ import (
 	"unsafe"
 )
 
-// isTerminal asks the kernel for terminal attributes instead of relying on
-// filesystem metadata. Devices such as /dev/null are character devices too,
-// but reject TCGETS and must therefore be treated as non-interactive streams.
+// isTerminal asks the kernel for terminal attributes without consuming input
+// filesystem metadata alone cannot distinguish terminals from /dev/null
+// non-terminal character devices reject TCGETS and fail closed
 func isTerminal(file *os.File) bool {
 	var attributes syscall.Termios
 	_, _, errno := syscall.Syscall6(

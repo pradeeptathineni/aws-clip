@@ -1,4 +1,5 @@
 // workflow.go - Validate, preview, and execute policy-controlled AWS sequences
+
 package cli
 
 import (
@@ -11,6 +12,8 @@ import (
 	"strings"
 )
 
+// Input bounds keep workflow review and process counts predictable
+// byte limits apply to UTF-8 source bytes rather than displayed character count
 const (
 	workflowFileMaxBytes = 1024 * 1024
 	workflowNameMaxBytes = 80
@@ -20,9 +23,9 @@ const (
 	stepArgumentMaxBytes = 64 * 1024
 )
 
-// workflow is the versioned, reusable unit executed by aws-clip. Commands are
-// arrays rather than shell strings so spaces and metacharacters keep their
-// literal meaning and a workflow cannot acquire an accidental shell boundary.
+// workflow is the versioned reusable unit executed by aws-clip
+// Command arrays keep spaces and metacharacters literal
+// avoids the accidental shell boundary created by command strings
 type workflow struct {
 	SchemaVersion int            `json:"schema_version"`
 	Name          string         `json:"name"`
@@ -30,16 +33,17 @@ type workflow struct {
 	Steps         []workflowStep `json:"steps"`
 }
 
+// workflowStep names one literal AWS CLI invocation in execution order
 type workflowStep struct {
 	Name        string   `json:"name"`
 	Description string   `json:"description,omitempty"`
 	Command     []string `json:"command"`
 }
 
-// workflowPlan is the stable JSON representation produced by `plan --format
-// json`. It intentionally excludes command argument values: those values can
+// workflowPlan is the stable JSON representation produced by plan JSON output
+// Excludes command argument values because those values can
 // contain secrets or large request documents, while the service, operation,
-// descriptions, and policy decisions provide a useful review boundary.
+// descriptions, and policy decisions provide a useful review boundary
 type workflowPlan struct {
 	SchemaVersion           int                `json:"schema_version"`
 	Name                    string             `json:"name"`
@@ -50,6 +54,8 @@ type workflowPlan struct {
 	AccountApprovalRequired bool               `json:"account_approval_required"`
 }
 
+// workflowContext snapshots wrapper-owned execution settings for review
+// nil fields mean AWS CLI retains authority for the corresponding default
 type workflowContext struct {
 	Profile               *string `json:"profile"`
 	Region                *string `json:"region"`
@@ -61,6 +67,7 @@ type workflowContext struct {
 	ExpectedAccountID     *string `json:"expected_account_id,omitempty"`
 }
 
+// workflowPlanStep exposes command identity and policy reasoning without argument values
 type workflowPlanStep struct {
 	Index               int    `json:"index"`
 	Name                string `json:"name"`
@@ -71,6 +78,8 @@ type workflowPlanStep struct {
 	Reason              string `json:"reason"`
 }
 
+// readWorkflow loads one strict versioned workflow within configured bounds
+// returns path-aware I/O errors and validation errors before any AWS process starts
 func readWorkflow(path string, maxSteps int) (workflow, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -78,8 +87,8 @@ func readWorkflow(path string, maxSteps int) (workflow, error) {
 	}
 	defer file.Close()
 
-	// The extra byte distinguishes an exactly-full valid file from an oversized
-	// input without loading an unbounded local file into memory.
+	// The extra byte distinguishes an exactly-full valid file from an oversized input
+	// avoids loading an unbounded local file into memory
 	data, err := io.ReadAll(io.LimitReader(file, workflowFileMaxBytes+1))
 	if err != nil {
 		return workflow{}, fmt.Errorf("read workflow file %q: %w", path, err)
@@ -89,6 +98,7 @@ func readWorkflow(path string, maxSteps int) (workflow, error) {
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	// Strict fields make misspelled workflow inputs fail instead of disappearing
 	decoder.DisallowUnknownFields()
 	var result workflow
 	if err := decoder.Decode(&result); err != nil {
@@ -103,6 +113,7 @@ func readWorkflow(path string, maxSteps int) (workflow, error) {
 	return result, nil
 }
 
+// validateWorkflow enforces schema, review-size, uniqueness, and command invariants
 func validateWorkflow(candidate workflow, maxSteps int) error {
 	if candidate.SchemaVersion != 1 {
 		return errors.New("workflow schema_version must be 1")
@@ -140,6 +151,7 @@ func validateWorkflow(candidate workflow, maxSteps int) error {
 	return nil
 }
 
+// validateWorkflowText keeps named plan fields bounded and safe for line output
 func validateWorkflowText(field, value string, required bool, maxBytes int) error {
 	if required && strings.TrimSpace(value) == "" {
 		return fmt.Errorf("%s must not be empty", field)
@@ -153,6 +165,8 @@ func validateWorkflowText(field, value string, required bool, maxBytes int) erro
 	return nil
 }
 
+// validateWorkflowCommand accepts service and operation followed by literal arguments
+// rejects global context overrides that would invalidate the identity preflight
 func validateWorkflowCommand(label string, command []string) error {
 	if len(command) < 2 {
 		return fmt.Errorf("%s command requires an AWS service and operation", label)
@@ -179,6 +193,8 @@ func validateWorkflowCommand(label string, command []string) error {
 	return nil
 }
 
+// isAWSCommandToken accepts lowercase AWS service and operation name syntax
+// leading and trailing hyphens are rejected to keep classification unambiguous
 func isAWSCommandToken(value string) bool {
 	if value == "" {
 		return false
@@ -194,10 +210,13 @@ func isAWSCommandToken(value string) bool {
 	return true
 }
 
+// isLowercaseLetterOrDigit defines valid token boundary bytes
 func isLowercaseLetterOrDigit(character byte) bool {
 	return (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9')
 }
 
+// buildWorkflowPlan evaluates policy and account-approval needs without contacting AWS
+// clones optional settings so the returned machine contract owns its snapshot
 func buildWorkflowPlan(candidate workflow, settings Settings) workflowPlan {
 	var expectedAccount *string
 	protected := false
@@ -226,6 +245,7 @@ func buildWorkflowPlan(candidate workflow, settings Settings) workflowPlan {
 	}
 	for index, step := range candidate.Steps {
 		command := step.Command[0] + ":" + step.Command[1]
+		// Approval is a workflow-wide precondition whenever any step is risky
 		classification := classifyExecutionCommand(step.Command)
 		if classification.Destructive || classification.Costly || classification.Sensitive || protected && classification.Changing {
 			result.AccountApprovalRequired = true
@@ -249,6 +269,7 @@ func buildWorkflowPlan(candidate workflow, settings Settings) workflowPlan {
 	return result
 }
 
+// cloneOptionalString preserves nil while returning independent storage
 func cloneOptionalString(value *string) *string {
 	if value == nil {
 		return nil
@@ -256,6 +277,7 @@ func cloneOptionalString(value *string) *string {
 	return cloneString(value)
 }
 
+// cloneOptionalInt preserves nil while returning independent storage
 func cloneOptionalInt(value *int) *int {
 	if value == nil {
 		return nil
@@ -263,6 +285,8 @@ func cloneOptionalInt(value *int) *int {
 	return cloneInt(value)
 }
 
+// evaluateWorkflowCommand applies deny, safe-read default, then explicit allow
+// sensitive-output reads bypass the default and require a deliberate allow rule
 func evaluateWorkflowCommand(command string, policy WorkflowPolicy) (bool, string) {
 	for _, rule := range policy.Deny {
 		if wildcardMatch(rule, command) {
@@ -284,6 +308,8 @@ func evaluateWorkflowCommand(command string, policy WorkflowPolicy) (bool, strin
 	return false, "operation is not read-oriented or explicitly allowed"
 }
 
+// isSensitiveOutputOperation recognizes calls likely to return credentials or secrets
+// matching service and operation only avoids copying argument values into policy output
 func isSensitiveOutputOperation(command string) bool {
 	for _, pattern := range []string{
 		"codeartifact:get-authorization-token",
@@ -306,6 +332,8 @@ func isSensitiveOutputOperation(command string) bool {
 	return false
 }
 
+// isReadOperation conservatively recognizes conventional read-oriented AWS names
+// unrecognized operations default to writes and require configured policy allowance
 func isReadOperation(operation string) bool {
 	for _, exact := range []string{"describe", "get", "head", "list", "lookup", "ls", "scan", "search", "select", "tail", "validate", "wait"} {
 		if operation == exact {
@@ -320,6 +348,7 @@ func isReadOperation(operation string) bool {
 	return false
 }
 
+// validatePolicyRule limits rules to deterministic service:operation glob syntax
 func validatePolicyRule(rule string) error {
 	service, operation, found := strings.Cut(rule, ":")
 	if !found || strings.Contains(operation, ":") || service == "" || operation == "" {
@@ -335,9 +364,9 @@ func validatePolicyRule(rule string) error {
 	return nil
 }
 
-// wildcardMatch implements only the documented '*' wildcard. A purpose-built
-// matcher keeps policy behavior identical across operating systems and avoids
-// accepting character classes or path separators with surprising semantics.
+// wildcardMatch implements only the documented asterisk wildcard
+// Purpose-built matching keeps policy behavior identical across operating systems
+// rejects character classes and path-separator semantics from filesystem globs
 func wildcardMatch(pattern, value string) bool {
 	patternIndex, valueIndex := 0, 0
 	starIndex, starValueIndex := -1, 0
@@ -354,6 +383,7 @@ func wildcardMatch(pattern, value string) bool {
 			continue
 		}
 		if starIndex >= 0 {
+			// Retry from the most recent star with one additional consumed byte
 			patternIndex = starIndex + 1
 			starValueIndex++
 			valueIndex = starValueIndex
@@ -367,6 +397,7 @@ func wildcardMatch(pattern, value string) bool {
 	return patternIndex == len(pattern)
 }
 
+// writeWorkflowPlanText renders a concise review without command argument values
 func writeWorkflowPlanText(output io.Writer, plan workflowPlan) {
 	fmt.Fprintf(output, "Workflow: %s\n", plan.Name)
 	if plan.Description != "" {
@@ -397,12 +428,15 @@ func writeWorkflowPlanText(output io.Writer, plan workflowPlan) {
 	fmt.Fprintln(output, "Decision: blocked by workflow policy")
 }
 
+// writeWorkflowPlanJSON emits the versioned machine contract as one JSON value
 func writeWorkflowPlanJSON(output io.Writer, plan workflowPlan) error {
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(plan)
 }
 
+// runWorkflow executes validated steps sequentially with visibility on stderr
+// stops at the first failure and returns that native AWS CLI status
 func runWorkflow(awsPath string, candidate workflow, settings Settings, environ []string, rt runtime) int {
 	fmt.Fprintf(rt.stderr, "aws-clip: workflow %q: starting %d steps\n", candidate.Name, len(candidate.Steps))
 	for index, step := range candidate.Steps {
@@ -410,6 +444,7 @@ func runWorkflow(awsPath string, candidate workflow, settings Settings, environ 
 		fmt.Fprintf(rt.stderr, "aws-clip: step %d/%d %q (%s): started\n", index+1, len(candidate.Steps), step.Name, command)
 		status := runAWS(awsPath, effectiveArguments(step.Command, settings), environ, rt.stdin, rt.stdout, rt.stderr)
 		if status != exitOK {
+			// No rollback is attempted because AWS operations may be non-transactional
 			fmt.Fprintf(rt.stderr, "aws-clip: step %d/%d %q: failed with status %d; remaining steps skipped\n", index+1, len(candidate.Steps), step.Name, status)
 			return status
 		}

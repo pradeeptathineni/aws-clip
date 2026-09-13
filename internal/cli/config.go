@@ -1,4 +1,5 @@
 // config.go - Resolve aws-clip settings and validate local safety policy
+
 package cli
 
 import (
@@ -15,14 +16,17 @@ import (
 	"unicode/utf8"
 )
 
+// Local configuration name under the platform user configuration directory
 const configFileName = "config.json"
 
+// Conservative workflow size used when policy does not set a lower or higher bound
 const defaultMaxWorkflowSteps = 20
 
 // WorkflowPolicy defines the local guardrails applied to declarative
-// workflows. Read-oriented AWS operations are allowed by default; Allow adds
-// deliberate exceptions and Deny can impose organization-specific blocks.
-// Deny always wins when more than one rule matches.
+// workflows
+// Read-oriented AWS operations are allowed by default
+// Allow adds deliberate exceptions and Deny adds organization-specific blocks
+// Deny always wins when more than one rule matches
 type WorkflowPolicy struct {
 	// Allow names non-read operations permitted after all stronger guards pass
 	Allow []string
@@ -32,16 +36,18 @@ type WorkflowPolicy struct {
 	MaxSteps int
 }
 
+// workflowPolicyFile preserves omission within the nested JSON policy object
 type workflowPolicyFile struct {
 	Allow    []string `json:"allow"`
 	Deny     []string `json:"deny"`
 	MaxSteps *int     `json:"max_steps"`
 }
 
-// Settings is the fully resolved wrapper configuration. Optional AWS settings
+// Settings is the fully resolved wrapper configuration
+// Optional AWS settings
 // remain pointers so an absent value can be distinguished from an explicit
-// zero timeout. This distinction is important: aws-clip must defer to AWS CLI
-// configuration unless an operator deliberately supplies a wrapper setting.
+// zero timeout
+// aws-clip defers to AWS CLI unless an operator supplies a wrapper setting
 type Settings struct {
 	// AWSBinary selects the AWS CLI v2 executable
 	AWSBinary string
@@ -59,15 +65,15 @@ type Settings struct {
 	ReadTimeout *int
 	// WorkflowPolicy contains file-owned controls for reviewed sequences
 	WorkflowPolicy WorkflowPolicy
-	// ProtectedProfiles binds high-risk profile names to their expected AWS
-	// accounts. The map is configuration-file-only so ambient variables and
-	// one-off flags cannot silently weaken an established production guard.
+	// ProtectedProfiles binds high-risk profile names to their expected AWS accounts
+	// configuration-file-only to prevent ambient or one-off guard weakening
 	ProtectedProfiles map[string]string
 }
 
-// fileSettings mirrors the public JSON schema. Pointer fields preserve whether
-// a key was omitted, allowing environment variables and flags to override only
-// values that actually exist in a lower-precedence layer.
+// fileSettings mirrors the public JSON schema
+// Pointer fields preserve whether a key was omitted
+// allows environment variables and flags to override only
+// values that actually exist in a lower-precedence layer
 type fileSettings struct {
 	AWSBinary         *string             `json:"aws_binary"`
 	Profile           *string             `json:"profile"`
@@ -80,20 +86,23 @@ type fileSettings struct {
 	ProtectedProfiles map[string]string   `json:"protected_profiles"`
 }
 
-// overrides contains values explicitly supplied as wrapper command flags.
+// overrides contains values explicitly supplied as wrapper command flags
 // ConfigPath is handled separately because it selects the file from which the
-// rest of the settings are loaded.
+// rest of the settings are loaded
 type overrides struct {
 	fileSettings
 	ConfigPath *string
 }
 
+// loadedSettings pairs resolved values with configuration discovery diagnostics
 type loadedSettings struct {
 	Settings   Settings
 	ConfigPath string
 	ConfigRead bool
 }
 
+// resolveSettings applies defaults, file, environment, and flags in ascending precedence
+// configDir remains injectable so discovery failures and platform paths are testable
 func resolveSettings(flagValues overrides, environ []string, configDir func() (string, error)) (loadedSettings, error) {
 	path, explicit, err := resolveConfigPath(flagValues.ConfigPath, environ, configDir)
 	if err != nil {
@@ -108,6 +117,8 @@ func resolveSettings(flagValues overrides, environ []string, configDir func() (s
 		ConfigPath: path,
 	}
 
+	// Apply independent layers in documented ascending precedence
+	// policy and protected-profile settings exist only in the file layer
 	fromFile, read, err := readConfig(path, explicit)
 	if err != nil {
 		return loadedSettings{}, err
@@ -128,6 +139,8 @@ func resolveSettings(flagValues overrides, environ []string, configDir func() (s
 	return result, nil
 }
 
+// resolveConfigPath selects flag, environment, then platform-default location
+// explicit reports whether a missing file is an error rather than an optional default
 func resolveConfigPath(flagPath *string, environ []string, configDir func() (string, error)) (path string, explicit bool, err error) {
 	if flagPath != nil {
 		if strings.TrimSpace(*flagPath) == "" {
@@ -159,6 +172,8 @@ func resolveConfigPath(flagPath *string, environ []string, configDir func() (str
 	return path, false, nil
 }
 
+// readConfig decodes exactly one strict JSON object from path
+// missing default files are optional while explicitly selected files are required
 func readConfig(path string, required bool) (fileSettings, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -169,6 +184,7 @@ func readConfig(path string, required bool) (fileSettings, bool, error) {
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(data))
+	// Strict decoding prevents misspelled safety controls from appearing effective
 	decoder.DisallowUnknownFields()
 	var settings fileSettings
 	if err := decoder.Decode(&settings); err != nil {
@@ -180,6 +196,8 @@ func readConfig(path string, required bool) (fileSettings, bool, error) {
 	return settings, true, nil
 }
 
+// environmentSettings maps only AWS_CLIP variables into a precedence layer
+// numeric parse errors identify the setting without echoing its value
 func environmentSettings(environ []string) (fileSettings, error) {
 	var settings fileSettings
 	setStringFromEnvironment(environ, "AWS_CLIP_AWS_BINARY", &settings.AWSBinary)
@@ -200,6 +218,7 @@ func environmentSettings(environ []string) (fileSettings, error) {
 	return settings, nil
 }
 
+// setStringFromEnvironment preserves the distinction between unset and empty
 func setStringFromEnvironment(environ []string, name string, target **string) {
 	if value, ok := lookupEnvironment(environ, name); ok {
 		valueCopy := value
@@ -207,6 +226,7 @@ func setStringFromEnvironment(environ []string, name string, target **string) {
 	}
 }
 
+// intFromEnvironment parses an optional integer without exposing invalid input
 func intFromEnvironment(environ []string, name string) (*int, error) {
 	value, ok := lookupEnvironment(environ, name)
 	if !ok {
@@ -214,13 +234,15 @@ func intFromEnvironment(environ []string, name string) (*int, error) {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil {
-		// Configuration errors name the setting but deliberately omit its value.
-		// Arguments and environment values can contain sensitive operator data.
+		// Configuration errors name the setting but deliberately omit its value
+		// Arguments and environment values can contain sensitive operator data
 		return nil, fmt.Errorf("%s must be an integer", name)
 	}
 	return &parsed, nil
 }
 
+// lookupEnvironment returns the last exact-name entry to match process semantics
+// exact matching preserves case-sensitive AWS variable behavior on supported shells
 func lookupEnvironment(environ []string, name string) (string, bool) {
 	for i := len(environ) - 1; i >= 0; i-- {
 		key, value, found := strings.Cut(environ[i], "=")
@@ -231,6 +253,8 @@ func lookupEnvironment(environ []string, name string) (string, bool) {
 	return "", false
 }
 
+// applyLayer copies present values over target without aliasing mutable slices or maps
+// workflow policy and protected profiles remain file-owned because later layers omit them
 func applyLayer(target *Settings, layer fileSettings) {
 	if layer.AWSBinary != nil {
 		target.AWSBinary = *layer.AWSBinary
@@ -254,6 +278,7 @@ func applyLayer(target *Settings, layer fileSettings) {
 		target.ReadTimeout = cloneInt(layer.ReadTimeout)
 	}
 	if layer.WorkflowPolicy != nil {
+		// Replacing the complete policy avoids accidental merging across layers
 		target.WorkflowPolicy = WorkflowPolicy{
 			Allow:    append([]string(nil), layer.WorkflowPolicy.Allow...),
 			Deny:     append([]string(nil), layer.WorkflowPolicy.Deny...),
@@ -264,6 +289,7 @@ func applyLayer(target *Settings, layer fileSettings) {
 		}
 	}
 	if layer.ProtectedProfiles != nil {
+		// Copy account bindings so callers cannot mutate decoded configuration indirectly
 		target.ProtectedProfiles = make(map[string]string, len(layer.ProtectedProfiles))
 		for profile, accountID := range layer.ProtectedProfiles {
 			target.ProtectedProfiles[profile] = accountID
@@ -271,16 +297,20 @@ func applyLayer(target *Settings, layer fileSettings) {
 	}
 }
 
+// cloneString returns an independently owned optional value
 func cloneString(value *string) *string {
 	copy := *value
 	return &copy
 }
 
+// cloneInt returns an independently owned optional value
 func cloneInt(value *int) *int {
 	copy := *value
 	return &copy
 }
 
+// validateSettings enforces bounds and diagnostic-safe text after all layers merge
+// validates the final effective state so overridden invalid lower values do not leak
 func validateSettings(settings Settings) error {
 	if strings.TrimSpace(settings.AWSBinary) == "" {
 		return errors.New("AWS binary path must not be empty")
@@ -339,8 +369,8 @@ func validateSettings(settings Settings) error {
 }
 
 // isAWSAccountID validates the fixed-width decimal identifier returned by AWS
-// STS and used by account guards. Keeping this check local avoids accepting an
-// ARN, alias, or malformed value as an account-bound approval token.
+// STS and used by account guards
+// rejects ARNs, aliases, and malformed account-bound approval tokens
 func isAWSAccountID(value string) bool {
 	if len(value) != 12 {
 		return false
@@ -354,9 +384,11 @@ func isAWSAccountID(value string) bool {
 }
 
 // isPrintableSingleLine defines the text accepted for values that may appear in
-// diagnostics. Besides ASCII control characters, unicode.IsPrint excludes line
+// diagnostics
+// Besides ASCII control characters, unicode.IsPrint excludes line
 // and paragraph separators, formatting controls, and other runes that can alter
-// terminal presentation. Invalid UTF-8 is rejected so output stays portable.
+// terminal presentation
+// Invalid UTF-8 is rejected so output stays portable
 func isPrintableSingleLine(value string) bool {
 	if !utf8.ValidString(value) {
 		return false
