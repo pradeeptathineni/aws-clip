@@ -190,35 +190,35 @@ func TestContextVerifiesProtectedAccountAndReturnsStableJSON(t *testing.T) {
 	}
 }
 
-func TestExecRequiresIdentityBoundApprovalForDestructiveOperations(t *testing.T) {
+func TestExecRequiresConfirmationForDestructiveOperations(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	command := []string{"ec2", "terminate-instances", "--instance-ids", "i-example"}
 
-	t.Run("preview blocks before operation", func(t *testing.T) {
+	t.Run("non-interactive execution is refused", func(t *testing.T) {
 		callLog := filepath.Join(t.TempDir(), "calls.jsonl")
 		rt, stdout, stderr := testRuntime(t, false, nil, "FAKE_CALL_LOG="+callLog)
 		arguments := append([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--"}, command...)
 		status := run(arguments, rt)
-		if status != exitPolicy || stdout.Len() != 0 || !strings.Contains(stderr.String(), "--approve-account 123456789012") {
+		if status != exitConfirmation || stdout.Len() != 0 || !strings.Contains(stderr.String(), "--yes") {
 			t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 		}
-		want := [][]string{{"--version"}, fakeIdentityArguments(), fakeProfileRegionArguments("operations")}
+		want := [][]string{{"--version"}, fakeProfileRegionArguments("operations")}
 		if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, want) {
-			t.Fatalf("calls = %#v, want identity preflight only", calls)
+			t.Fatalf("calls = %#v, want no identity or target operation", calls)
 		}
 	})
 
-	t.Run("matching account approval permits operation", func(t *testing.T) {
+	t.Run("yes permits operation", func(t *testing.T) {
 		callLog := filepath.Join(t.TempDir(), "calls.jsonl")
 		rt, _, stderr := testRuntime(t, false, nil, "FAKE_CALL_LOG="+callLog)
-		arguments := []string{"--aws-binary", fake, "--profile", "operations", "exec", "--approve-account", "123456789012", "--"}
+		arguments := []string{"--aws-binary", fake, "--profile", "operations", "exec", "--yes", "--"}
 		arguments = append(arguments, command...)
 		status := run(arguments, rt)
 		if status != exitOK {
 			t.Fatalf("status = %d, stderr = %q", status, stderr.String())
 		}
 		if !containsCall(readCallLog(t, callLog), command) {
-			t.Fatal("approved destructive operation did not run")
+			t.Fatal("confirmed destructive operation did not run")
 		}
 	})
 }
@@ -241,7 +241,7 @@ func TestExecBlocksProfileOverridesAndCredentialEnvironment(t *testing.T) {
 	t.Run("AWS profile argument", func(t *testing.T) {
 		rt, stdout, stderr := testRuntime(t, false, nil)
 		status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "ec2", "describe-regions", "--profile", "other"}, rt)
-		if status != exitUsage || stdout.Len() != 0 || !strings.Contains(stderr.String(), "invalidate the verified profile context") {
+		if status != exitUsage || stdout.Len() != 0 || !strings.Contains(stderr.String(), "invalidate the selected profile context") {
 			t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 		}
 	})
@@ -271,15 +271,15 @@ func TestProtectedProfileRejectsAccountMismatch(t *testing.T) {
 	rt, stdout, stderr := testRuntime(t, false, nil, "FAKE_CALL_LOG="+callLog)
 
 	status := run([]string{"--config", configPath, "--aws-binary", fake, "exec", "--", "ec2", "describe-regions"}, rt)
-	if status != exitPolicy || stdout.Len() != 0 || !strings.Contains(stderr.String(), "account mismatch") {
+	if status != exitIdentity || stdout.Len() != 0 || !strings.Contains(stderr.String(), "identity mismatch") {
 		t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 	}
-	if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, [][]string{{"--version"}, fakeIdentityArguments()}) {
+	if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, [][]string{{"--version"}, fakeProfileRegionArguments("prod"), fakeIdentityArguments()}) {
 		t.Fatalf("calls = %#v, want no service operation", calls)
 	}
 }
 
-func TestProtectedProfileRequiresAccountApprovalForChanges(t *testing.T) {
+func TestProtectedProfileRequiresConfirmationForChanges(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	configPath := writeConfig(t, `{"profile":"prod","protected_profiles":{"prod":"123456789012"}}`)
 	callLog := filepath.Join(t.TempDir(), "calls.jsonl")
@@ -288,15 +288,15 @@ func TestProtectedProfileRequiresAccountApprovalForChanges(t *testing.T) {
 
 	arguments := append([]string{"--config", configPath, "--aws-binary", fake, "exec", "--"}, command...)
 	status := run(arguments, rt)
-	if status != exitPolicy || stdout.Len() != 0 || !strings.Contains(stderr.String(), "change on protected profile") {
+	if status != exitConfirmation || stdout.Len() != 0 || !strings.Contains(stderr.String(), "confirmation refused") {
 		t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 	}
 	if containsCall(readCallLog(t, callLog), command) {
-		t.Fatal("protected-profile change ran without account approval")
+		t.Fatal("protected-profile change ran without confirmation")
 	}
 }
 
-func TestPotentiallyCostlyOperationsRequireAccountApproval(t *testing.T) {
+func TestPotentiallyCostlyOperationsRequireConfirmation(t *testing.T) {
 	fake := makeProcessAlias(t, "fake-aws")
 	tests := []struct {
 		name    string
@@ -315,11 +315,11 @@ func TestPotentiallyCostlyOperationsRequireAccountApproval(t *testing.T) {
 
 			status := run(arguments, rt)
 
-			if status != exitPolicy || stdout.Len() != 0 || !strings.Contains(stderr.String(), "potentially costly operation") {
+			if status != exitConfirmation || stdout.Len() != 0 || !strings.Contains(stderr.String(), "confirmation refused") {
 				t.Fatalf("status = %d, stdout = %q, stderr = %q", status, stdout.String(), stderr.String())
 			}
 			if containsCall(readCallLog(t, callLog), test.command) {
-				t.Fatal("potentially costly operation ran without account approval")
+				t.Fatal("potentially costly operation ran without confirmation")
 			}
 		})
 	}

@@ -63,11 +63,12 @@ type contextDocument struct {
 
 // Classification contains normalized command identity and guard facts, never argument values
 type executionOperation struct {
-	Command     string
-	Changing    bool
-	Destructive bool
-	Costly      bool
-	Sensitive   bool
+	Command        string
+	Classification string
+	Changing       bool
+	Destructive    bool
+	Costly         bool
+	Sensitive      bool
 }
 
 // boundedOutput discards overflow while reporting it consumed to bound memory without blocking
@@ -520,19 +521,6 @@ func runLogout(path string, settings Settings, environ []string, approval string
 	}
 }
 
-// Guarded execution intentionally offers no unverified passthrough mode
-func runProfileExec(path string, arguments []string, settings Settings, environ []string, approvalAccount string, rt runtime) int {
-	if err := validateWorkflowCommand("exec", arguments); err != nil {
-		fmt.Fprintf(rt.stderr, "aws-clip: %s\n", err)
-		return exitUsage
-	}
-	operation := classifyExecutionCommand(arguments)
-	if _, status := prepareProfileExecution(path, settings, environ, rt, []executionOperation{operation}, approvalAccount); status != exitOK {
-		return status
-	}
-	return runAWS(path, effectiveArguments(arguments, settings), environ, rt.stdin, rt.stdout, rt.stderr)
-}
-
 // Verify STS identity before account approval so a profile name cannot satisfy a guard
 func prepareProfileExecution(path string, settings Settings, environ []string, rt runtime, operations []executionOperation, approvalAccount string) (identityRecord, int) {
 	profile, err := selectedProfile(settings)
@@ -552,7 +540,7 @@ func prepareProfileExecution(path string, settings Settings, environ []string, r
 	// Account mismatch always wins and cannot be overridden by an approval token
 	if protected && identity.Account != expected {
 		fmt.Fprintf(rt.stderr, "aws-clip: account mismatch for protected profile %q: expected %s, current %s\n", profile, expected, identity.Account)
-		return identityRecord{}, exitPolicy
+		return identityRecord{}, exitIdentity
 	}
 
 	reasons := make(map[string]bool)
@@ -593,9 +581,16 @@ func prepareProfileExecution(path string, settings Settings, environ []string, r
 func classifyExecutionCommand(arguments []string) executionOperation {
 	command := arguments[0] + ":" + arguments[1]
 	operation := executionOperation{
-		Command:   command,
-		Changing:  !isReadOperation(arguments[1]),
-		Sensitive: isSensitiveOutputOperation(command),
+		Command:        command,
+		Classification: "unknown; treated as mutating",
+		Changing:       true,
+		Sensitive:      isSensitiveOutputOperation(command),
+	}
+	if isReadOperation(arguments[1]) {
+		operation.Classification = "read-only"
+		operation.Changing = false
+	} else if isKnownMutatingOperation(arguments[0], arguments[1]) {
+		operation.Classification = "mutating"
 	}
 	for _, prefix := range []string{"cancel-", "close-", "delete-", "deregister-", "detach-", "disable-", "disassociate-", "purge-", "remove-", "revoke-", "stop-", "terminate-"} {
 		if strings.HasPrefix(arguments[1], prefix) {
@@ -622,6 +617,25 @@ func classifyExecutionCommand(arguments []string) executionOperation {
 		}
 	}
 	return operation
+}
+
+func isKnownMutatingOperation(service, operation string) bool {
+	for _, prefix := range []string{
+		"add-", "associate-", "attach-", "authorize-", "cancel-", "close-", "create-", "delete-", "deregister-", "detach-",
+		"disable-", "disassociate-", "enable-", "launch-", "modify-", "move-", "put-", "purchase-", "reboot-", "register-",
+		"remove-", "restore-", "revoke-", "run-", "scale-", "set-", "start-", "stop-", "tag-", "terminate-", "untag-", "update-", "upload-",
+	} {
+		if strings.HasPrefix(operation, prefix) {
+			return true
+		}
+	}
+	if service == "s3" {
+		switch operation {
+		case "cp", "mv", "rb", "rm", "sync":
+			return true
+		}
+	}
+	return service == "cloudformation" && operation == "deploy"
 }
 
 // Return only the option name so diagnostics never echo supplied values
@@ -678,7 +692,7 @@ func verifyExpectedAccount(profile profileRecord, identity identityRecord, stder
 		return exitOK
 	}
 	fmt.Fprintf(stderr, "aws-clip: account mismatch for protected profile %q: expected %s, current %s\n", profile.Name, *profile.ExpectedAccount, identity.Account)
-	return exitPolicy
+	return exitIdentity
 }
 
 func containsString(values []string, target string) bool {

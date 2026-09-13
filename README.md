@@ -118,9 +118,10 @@ and timeout settings continue to defer to AWS CLI.
 ## Guarded command execution
 
 `exec` is intentionally more restrictive than `aws --profile`. It requires an
-explicit profile, rejects context-changing AWS arguments, verifies STS identity,
-shows the verified profile/account/principal/Region on stderr, applies account
-guards, then passes literal arguments and standard streams to AWS CLI:
+explicit profile, rejects context-changing AWS arguments, classifies the
+service and operation, applies local command policy, and shows the target
+profile, Region, classification, and policy decision on stderr before passing
+literal arguments and standard streams to AWS CLI:
 
 ```sh
 aws-clip --profile development exec -- ec2 describe-instances --output json
@@ -129,26 +130,65 @@ aws-clip --profile development exec -- ec2 describe-instances --output json
 The `--` separator is mandatory. Values after it are never run through a shell.
 Use wrapper `--profile` and `--region`; `--profile`, `--region`,
 `--endpoint-url`, and `--no-sign-request` after the separator are rejected
-because they would invalidate the verified context.
+because they would invalidate the resolved target context.
 
-Destructive and potentially costly operations require approval using the
-account returned by the preflight. Credential-, token-, or secret-returning
-operations receive the same guard. The blocked preview prints the exact account
-approval needed:
+Only documented non-mutating operation families such as `list-*`,
+`describe-*`, `get-*`, `head-*`, `lookup-*`, `search-*`, `validate-*`, and
+`wait` are treated as read-only. Known mutations and unrecognized operations
+require confirmation. Interactive use prompts with the target context;
+non-interactive use fails unless `--yes` is supplied. Known credential-,
+token-, or secret-returning operations require the same confirmation even when
+their operation name looks read-only:
 
 ```sh
 aws-clip --profile development exec -- ec2 terminate-instances --instance-ids i-example
-aws-clip --profile development exec --approve-account 123456789012 -- \
+aws-clip --profile development exec --yes -- \
   ec2 terminate-instances --instance-ids i-example
 ```
 
-Destructive recognition covers common operation prefixes such as `delete-`,
-`terminate-`, `remove-`, `disable-`, `stop-`, and `revoke-`, plus `s3 rm`,
-`s3 rb`, and `s3 sync --delete`. Potential-cost recognition covers common
-`create-`, `launch-`, `purchase-`, `run-`, `scale-`, and `start-` operations,
-S3 copy/move/sync, plus common deployment commands. These are conservative
-name-based checks, not replacements for IAM, service control policies, budgets,
-backups, or change management.
+Preview is explicitly local: it resolves the executable path but starts no AWS
+CLI process, performs no identity preflight, and prints no option values. A
+Region inherited only from the selected AWS profile is reported as unresolved;
+pass `--region` when an offline preview must evaluate a Region allowlist.
+
+```sh
+aws-clip --profile development --region us-east-1 exec --preview -- \
+  secretsmanager put-secret-value --secret-id example --secret-string hidden
+```
+
+The preview shows only `secretsmanager:put-secret-value` and the option names
+`--secret-id` and `--secret-string`. Classification is deliberately
+conservative and name-based: a new, aliased, or ambiguous AWS operation is
+treated as mutating. Policy and confirmation supplement IAM, service control
+policies, budgets, backups, and change management; they do not infer the effect
+of argument values or remote state.
+
+### Restrict direct commands
+
+File-only command policy can deny operations or turn commands and target
+context into allowlists. Deny rules always win. When `allow` is non-empty, the
+command must match it; each non-empty target allowlist must also match.
+
+```json
+{
+  "profile": "automation",
+  "region": "us-east-1",
+  "command_policy": {
+    "allow": ["ec2:describe-*", "s3api:put-object"],
+    "deny": ["*:delete-*", "ec2:terminate-*"],
+    "allowed_profiles": ["automation"],
+    "allowed_regions": ["us-east-1"],
+    "allowed_account_ids": ["123456789012"]
+  }
+}
+```
+
+An account allowlist triggers `sts get-caller-identity` immediately before the
+confirmation and target command. An account mismatch cannot be overridden by
+`--yes`. Without an account allowlist or protected-profile binding, ordinary
+execution does not call STS. Supplying `--approve-account` explicitly also
+requests an identity check and requires the observed account to match; it does
+not replace `--yes` for non-interactive state changes.
 
 ### Protect production profiles
 
@@ -165,11 +205,12 @@ file:
 }
 ```
 
-Every live context or execution check fails if `production` resolves to a
-different account. On the expected account, every non-read operation requires
-`--approve-account 123456789012`; read-oriented commands do not. Protection is
-configuration-file-only, so an environment variable or one-off flag cannot
-weaken it.
+Every live context or execution check fails with the identity-mismatch status
+if `production` resolves to a different account. On the expected account,
+every non-read operation still requires interactive confirmation or `--yes`.
+Use `--approve-account 123456789012` as an additional identity-bound check when
+needed. Protection is configuration-file-only, so an environment variable or
+one-off flag cannot weaken it.
 
 For isolation, `context`, `login`, guarded `exec`, and workflow execution block
 credential environment variables such as `AWS_ACCESS_KEY_ID`,
@@ -308,8 +349,11 @@ user configuration, then wrapper default:
 | `--connect-timeout SECONDS` | `AWS_CLIP_CONNECT_TIMEOUT` | `connect_timeout_seconds` | Set AWS socket connection timeout; `0` disables |
 | `--read-timeout SECONDS` | `AWS_CLIP_READ_TIMEOUT` | `read_timeout_seconds` | Set AWS socket read timeout; `0` disables |
 
-`protected_profiles` and `workflow_policy` are file-only safety settings.
-Automation should pin and protect the selected configuration file.
+`command_policy`, `protected_profiles`, and `workflow_policy` are file-only
+safety settings. Command and workflow rules use lowercase `service:operation`
+patterns with `*` as the only wildcard. Each command-policy list accepts at
+most 100 entries. Automation should pin and protect the selected configuration
+file.
 
 When any standard stream is not a terminal, `aws-clip` sets `AWS_PAGER` to an
 empty value and `AWS_CLI_AUTO_PROMPT=off` so automation cannot block on a pager
@@ -320,9 +364,10 @@ or prompt. Interactive runs leave both settings unchanged.
 - `aws-clip` never retains, writes, prints, exports, or caches credential values
 - AWS command stdout and stderr remain AWS-owned and can contain sensitive
   service data; protect them as you would direct AWS CLI output
-- Profile and workflow classification uses safe configuration metadata and
+- Command and workflow classification uses safe configuration metadata and
   operation names; IAM and AWS Organizations remain authoritative
-- Guarded commands require network access to STS before the service operation
+- Direct commands require STS only for an account allowlist, protected profile,
+  or explicit account approval; workflows retain their identity preflight
 - Identity preflight and the service command are separate AWS CLI processes;
   an external credential provider can change between them
 - Intentionally environment-backed credentials are outside profile isolation
@@ -340,7 +385,9 @@ or prompt. Interactive runs leave both settings unchanged.
 | `0` | Requested check or operation succeeded |
 | AWS CLI status | An AWS CLI command started and failed; its status is unchanged |
 | `2` | Invalid syntax, configuration, profile, workflow, or acknowledgement |
-| `3` | Identity isolation, account guard, or workflow policy blocked execution |
+| `3` | Command/workflow policy or credential isolation blocked execution |
+| `4` | Required command confirmation was refused or cancelled |
+| `5` | The verified AWS account did not match an account constraint |
 | `126` | AWS CLI could not be validated or started, or returned invalid local data |
 | `127` | AWS CLI executable was not found |
 

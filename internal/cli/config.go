@@ -33,10 +33,33 @@ type WorkflowPolicy struct {
 	MaxSteps int
 }
 
+// CommandPolicy limits direct exec targets independently of confirmation.
+// Deny rules take precedence, and each non-empty allowlist must match.
+type CommandPolicy struct {
+	// Allow restricts execution to matching service-operation identities when set.
+	Allow []string
+	// Deny blocks matching service-operation identities even when Allow matches.
+	Deny []string
+	// AllowedProfiles restricts selected profile names by exact match.
+	AllowedProfiles []string
+	// AllowedRegions restricts resolved Regions by exact match.
+	AllowedRegions []string
+	// AllowedAccountIDs restricts the live STS account by exact match.
+	AllowedAccountIDs []string
+}
+
 type workflowPolicyFile struct {
 	Allow    []string `json:"allow"`
 	Deny     []string `json:"deny"`
 	MaxSteps *int     `json:"max_steps"`
+}
+
+type commandPolicyFile struct {
+	Allow             []string `json:"allow"`
+	Deny              []string `json:"deny"`
+	AllowedProfiles   []string `json:"allowed_profiles"`
+	AllowedRegions    []string `json:"allowed_regions"`
+	AllowedAccountIDs []string `json:"allowed_account_ids"`
 }
 
 // Settings contains the fully resolved wrapper configuration.
@@ -58,6 +81,8 @@ type Settings struct {
 	ReadTimeout *int
 	// WorkflowPolicy controls reviewed command sequences.
 	WorkflowPolicy WorkflowPolicy
+	// CommandPolicy constrains direct exec targets before confirmation.
+	CommandPolicy CommandPolicy
 	// ProtectedProfiles binds high-risk profile names to expected AWS accounts.
 	// It is file-only so ambient or one-off settings cannot weaken the guard.
 	ProtectedProfiles map[string]string
@@ -73,6 +98,7 @@ type fileSettings struct {
 	ConnectTimeout    *int                `json:"connect_timeout_seconds"`
 	ReadTimeout       *int                `json:"read_timeout_seconds"`
 	WorkflowPolicy    *workflowPolicyFile `json:"workflow_policy"`
+	CommandPolicy     *commandPolicyFile  `json:"command_policy"`
 	ProtectedProfiles map[string]string   `json:"protected_profiles"`
 }
 
@@ -263,6 +289,15 @@ func applyLayer(target *Settings, layer fileSettings) {
 			target.WorkflowPolicy.MaxSteps = *layer.WorkflowPolicy.MaxSteps
 		}
 	}
+	if layer.CommandPolicy != nil {
+		target.CommandPolicy = CommandPolicy{
+			Allow:             append([]string(nil), layer.CommandPolicy.Allow...),
+			Deny:              append([]string(nil), layer.CommandPolicy.Deny...),
+			AllowedProfiles:   append([]string(nil), layer.CommandPolicy.AllowedProfiles...),
+			AllowedRegions:    append([]string(nil), layer.CommandPolicy.AllowedRegions...),
+			AllowedAccountIDs: append([]string(nil), layer.CommandPolicy.AllowedAccountIDs...),
+		}
+	}
 	if layer.ProtectedProfiles != nil {
 		target.ProtectedProfiles = make(map[string]string, len(layer.ProtectedProfiles))
 		for profile, accountID := range layer.ProtectedProfiles {
@@ -326,6 +361,32 @@ func validateSettings(settings Settings) error {
 	for _, rule := range append(append([]string(nil), settings.WorkflowPolicy.Allow...), settings.WorkflowPolicy.Deny...) {
 		if err := validatePolicyRule(rule); err != nil {
 			return err
+		}
+	}
+	if len(settings.CommandPolicy.Allow) > 100 || len(settings.CommandPolicy.Deny) > 100 {
+		return errors.New("command policy supports at most 100 allow and 100 deny rules")
+	}
+	for _, rule := range append(append([]string(nil), settings.CommandPolicy.Allow...), settings.CommandPolicy.Deny...) {
+		if err := validatePolicyRule(rule); err != nil {
+			return err
+		}
+	}
+	if len(settings.CommandPolicy.AllowedProfiles) > 100 || len(settings.CommandPolicy.AllowedRegions) > 100 || len(settings.CommandPolicy.AllowedAccountIDs) > 100 {
+		return errors.New("command policy supports at most 100 allowed profiles, regions, and account IDs")
+	}
+	for _, profile := range settings.CommandPolicy.AllowedProfiles {
+		if strings.TrimSpace(profile) == "" || !isPrintableSingleLine(profile) {
+			return errors.New("command policy allowed profiles must be non-empty, printable, and single-line")
+		}
+	}
+	for _, region := range settings.CommandPolicy.AllowedRegions {
+		if strings.TrimSpace(region) == "" || !isPrintableSingleLine(region) {
+			return errors.New("command policy allowed regions must be non-empty, printable, and single-line")
+		}
+	}
+	for _, accountID := range settings.CommandPolicy.AllowedAccountIDs {
+		if !isAWSAccountID(accountID) {
+			return errors.New("command policy allowed account IDs must be 12 digits")
 		}
 	}
 	for profile, accountID := range settings.ProtectedProfiles {

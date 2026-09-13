@@ -225,11 +225,11 @@ func TestExecPassesArgumentsLiterallyAndReturnsAWSStatus(t *testing.T) {
 		"FAKE_EXIT_CODE=37",
 	)
 
-	status := run(append([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--"}, arguments...), rt)
+	status := run(append([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--yes", "--"}, arguments...), rt)
 	if status != 37 {
 		t.Fatalf("status = %d, want 37; stderr = %q", status, stderr.String())
 	}
-	if stdout.String() != "aws output\n" || !strings.Contains(stderr.String(), "context profile=operations account=123456789012") || !strings.HasSuffix(stderr.String(), "aws diagnostic\n") {
+	if stdout.String() != "aws output\n" || !strings.Contains(stderr.String(), "target profile=operations") || !strings.HasSuffix(stderr.String(), "aws diagnostic\n") {
 		t.Fatalf("streams changed: stdout %q, stderr %q", stdout.String(), stderr.String())
 	}
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
@@ -240,8 +240,8 @@ func TestExecPassesArgumentsLiterallyAndReturnsAWSStatus(t *testing.T) {
 	if !reflect.DeepEqual(observed.Arguments, arguments) {
 		t.Fatalf("arguments = %#v, want %#v", observed.Arguments, arguments)
 	}
-	if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, [][]string{{"--version"}, fakeIdentityArguments(), fakeProfileRegionArguments("operations"), arguments}) {
-		t.Fatalf("process calls = %#v, want version, identity preflight, and AWS operation", calls)
+	if calls := readCallLog(t, callLog); !reflect.DeepEqual(calls, [][]string{{"--version"}, fakeProfileRegionArguments("operations"), arguments}) {
+		t.Fatalf("process calls = %#v, want version, Region lookup, and AWS operation", calls)
 	}
 }
 
@@ -250,7 +250,7 @@ func TestExecPreservesBinaryStdinStdoutAndStderr(t *testing.T) {
 	input := []byte{0x00, 'i', 'n', '\n', 0xff}
 	rt, stdout, stderr := testRuntime(t, false, bytes.NewReader(input), "FAKE_MODE=binary-streams")
 
-	status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "service", "operation"}, rt)
+	status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--yes", "--", "service", "operation"}, rt)
 	if status != 0 {
 		t.Fatalf("status = %d, want 0; stderr = %q", status, stderr.Bytes())
 	}
@@ -274,7 +274,7 @@ func TestNonTTYDisablesPagerAndAutoPromptWithoutAddingOutput(t *testing.T) {
 	)
 
 	status := run([]string{"--aws-binary", fake, "--profile", "operations", "exec", "--", "sts", "get-caller-identity"}, rt)
-	if status != 0 || !strings.Contains(stderr.String(), "context profile=operations") {
+	if status != 0 || !strings.Contains(stderr.String(), "target profile=operations") {
 		t.Fatalf("status = %d, stderr = %q", status, stderr.String())
 	}
 	if stdout.String() != "only child output\n" {
@@ -677,11 +677,12 @@ func testRuntime(t *testing.T, interactive bool, stdin io.Reader, additionalEnvi
 	configRoot := t.TempDir()
 	environment := append(baseEnvironment(), additionalEnvironment...)
 	return runtime{
-		stdin:       stdin,
-		stdout:      stdout,
-		stderr:      stderr,
-		environ:     environment,
-		interactive: interactive,
+		stdin:         stdin,
+		stdout:        stdout,
+		stderr:        stderr,
+		environ:       environment,
+		interactive:   interactive,
+		stdinTerminal: interactive,
 		userConfigDir: func() (string, error) {
 			return configRoot, nil
 		},

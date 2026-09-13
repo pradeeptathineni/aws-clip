@@ -174,7 +174,7 @@ func validateWorkflowCommand(label string, command []string) error {
 		return fmt.Errorf("%s command must begin with a lowercase AWS service and operation", label)
 	}
 	if option := contextOverrideArgument(command[2:]); option != "" {
-		return fmt.Errorf("%s command contains %s, which would invalidate the verified profile context", label, option)
+		return fmt.Errorf("%s command contains %s, which would invalidate the selected profile context", label, option)
 	}
 	return nil
 }
@@ -329,12 +329,12 @@ func isReadOperation(operation string) bool {
 func validatePolicyRule(rule string) error {
 	service, operation, found := strings.Cut(rule, ":")
 	if !found || strings.Contains(operation, ":") || service == "" || operation == "" {
-		return errors.New("workflow policy rules must use service:operation patterns")
+		return errors.New("policy rules must use service:operation patterns")
 	}
 	for _, part := range []string{service, operation} {
 		for _, character := range part {
 			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' && character != '*' {
-				return errors.New("workflow policy rules may contain lowercase letters, digits, hyphens, and * wildcards")
+				return errors.New("policy rules may contain lowercase letters, digits, hyphens, and * wildcards")
 			}
 		}
 	}

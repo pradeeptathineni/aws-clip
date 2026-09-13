@@ -22,6 +22,8 @@ const (
 	exitOK           = 0
 	exitUsage        = 2
 	exitPolicy       = 3
+	exitConfirmation = 4
+	exitIdentity     = 5
 	exitCannotRun    = 126
 	exitNotFound     = 127
 	versionOutputMax = 64 * 1024
@@ -37,6 +39,7 @@ type runtime struct {
 	stderr        io.Writer
 	environ       []string
 	interactive   bool
+	stdinTerminal bool
 	userConfigDir func() (string, error)
 }
 
@@ -50,6 +53,7 @@ func Main(args []string, stdin *os.File, stdout, stderr *os.File) int {
 		stderr:        stderr,
 		environ:       os.Environ(),
 		interactive:   isTerminal(stdin) && isTerminal(stdout) && isTerminal(stderr),
+		stdinTerminal: isTerminal(stdin),
 		userConfigDir: os.UserConfigDir,
 	})
 }
@@ -127,6 +131,26 @@ func run(args []string, rt runtime) int {
 		}
 		return runWorkflow(path, candidate, loaded.Settings, childEnvironment, rt)
 	}
+	if request.command == "exec" {
+		if err := validateWorkflowCommand("exec", request.awsArguments); err != nil {
+			fmt.Fprintf(rt.stderr, "aws-clip: %s\n", err)
+			return exitUsage
+		}
+		path, err := resolveAWSBinary(loaded.Settings.AWSBinary)
+		if err != nil {
+			fmt.Fprintf(rt.stderr, "aws-clip: %s\n", printableLine(err.Error()))
+			return exitNotFound
+		}
+		childEnvironment := effectiveEnvironment(rt.environ, loaded.Settings, rt.interactive)
+		if request.preview {
+			return writeExecutionPreview(path, request.awsArguments, loaded.Settings, childEnvironment, request.approvalAccount, request.yes, rt)
+		}
+		if _, err := inspectAWSVersion(path, childEnvironment); err != nil {
+			fmt.Fprintf(rt.stderr, "aws-clip: %s\n", printableLine(err.Error()))
+			return exitCannotRun
+		}
+		return runProfileExec(path, request.awsArguments, loaded.Settings, childEnvironment, request.approvalAccount, request.yes, rt)
+	}
 
 	path, err := resolveAWSBinary(loaded.Settings.AWSBinary)
 	if err != nil {
@@ -155,8 +179,6 @@ func run(args []string, rt runtime) int {
 		return runContext(path, loaded.Settings, childEnvironment, request.format, rt)
 	case "doctor":
 		return runDoctor(path, info, loaded, childEnvironment, rt)
-	case "exec":
-		return runProfileExec(path, request.awsArguments, loaded.Settings, childEnvironment, request.approvalAccount, rt)
 	default:
 		// Fail closed if parser and dispatch recognition ever diverge
 		fmt.Fprintln(rt.stderr, "aws-clip: internal command validation error")
@@ -186,6 +208,8 @@ type request struct {
 	approvalSet        bool
 	approvalAccountSet bool
 	formatSet          bool
+	yes                bool
+	preview            bool
 	help               bool
 }
 
@@ -224,6 +248,17 @@ func parseArguments(args []string) (request, error) {
 			name, inlineValue, hasInlineValue := strings.Cut(argument, "=")
 			if !recognizedOption(name) {
 				return request{}, errors.New("unknown wrapper option")
+			}
+			if name == "--yes" || name == "--preview" {
+				if hasInlineValue {
+					return request{}, fmt.Errorf("%s does not accept a value", name)
+				}
+				if name == "--yes" {
+					result.yes = true
+				} else {
+					result.preview = true
+				}
+				continue
 			}
 			value := inlineValue
 			if !hasInlineValue {
@@ -281,6 +316,9 @@ func parseArguments(args []string) (request, error) {
 	if result.command != "run" && result.command != "exec" && result.approvalAccountSet {
 		return request{}, errors.New("--approve-account is valid only with exec or run")
 	}
+	if result.command != "exec" && (result.yes || result.preview) {
+		return request{}, errors.New("--yes and --preview are valid only with exec")
+	}
 	if result.command == "plan" || result.command == "profiles" || result.command == "context" {
 		if !result.formatSet {
 			result.format = "text"
@@ -305,7 +343,7 @@ func isCommand(value string) bool {
 
 func recognizedOption(name string) bool {
 	switch name {
-	case "--config", "--aws-binary", "--profile", "--region", "--retry-mode", "--max-attempts", "--connect-timeout", "--read-timeout", "--approve", "--approve-account", "--format":
+	case "--config", "--aws-binary", "--profile", "--region", "--retry-mode", "--max-attempts", "--connect-timeout", "--read-timeout", "--approve", "--approve-account", "--format", "--yes", "--preview":
 		return true
 	default:
 		return false
@@ -503,6 +541,9 @@ func writeDoctor(output io.Writer, info awsInfo, loaded loadedSettings, interact
 	fmt.Fprintf(output, "read_timeout_seconds: %s\n", displayOptionalInt(loaded.Settings.ReadTimeout))
 	fmt.Fprintf(output, "workflow_policy: read-oriented default; %d allow rules; %d deny rules; max %d steps\n",
 		len(loaded.Settings.WorkflowPolicy.Allow), len(loaded.Settings.WorkflowPolicy.Deny), loaded.Settings.WorkflowPolicy.MaxSteps)
+	fmt.Fprintf(output, "command_policy: %d allow rules; %d deny rules; %d profile, %d region, and %d account constraints\n",
+		len(loaded.Settings.CommandPolicy.Allow), len(loaded.Settings.CommandPolicy.Deny), len(loaded.Settings.CommandPolicy.AllowedProfiles),
+		len(loaded.Settings.CommandPolicy.AllowedRegions), len(loaded.Settings.CommandPolicy.AllowedAccountIDs))
 	fmt.Fprintf(output, "protected_profiles: %d\n", len(loaded.Settings.ProtectedProfiles))
 	fmt.Fprintf(output, "stream_mode: %s\n", mode)
 }
@@ -535,7 +576,7 @@ const usageText = `Usage:
   aws-clip [wrapper options] login
   aws-clip [wrapper options] logout [--approve all-sso-sessions]
   aws-clip [wrapper options] context [--format text|json]
-  aws-clip [wrapper options] exec [--approve-account ID] -- <aws arguments...>
+  aws-clip [wrapper options] exec [--preview] [--yes] [--approve-account ID] -- <aws arguments...>
   aws-clip [wrapper options] doctor
   aws-clip [wrapper options] plan [--format text|json] <workflow.json>
   aws-clip [wrapper options] run --approve NAME [--approve-account ID] <workflow.json>
@@ -555,13 +596,17 @@ Output and workflow options:
   --approve NAME             Confirm the exact workflow name for run
 
 Safety options:
-  --approve-account ID       Confirm the verified account for guarded execution
+  --preview                  Explain a redacted exec decision without running AWS CLI
+  --yes                      Approve a mutating, unknown, or sensitive exec command
+  --approve-account ID       Bind guarded execution to the verified account
   --approve all-sso-sessions Confirm the global effect of AWS SSO logout
 
 Profiles, login, logout, context, exec, and doctor delegate configuration,
 authentication, credentials, and service calls to AWS CLI v2. Exec requires an
-explicit profile, verifies its STS identity, and applies account guards. Plan
-and run retain policy-controlled sequences for operations that need review,
-named approval, fail-fast behavior, and step visibility. The -- separator is
-mandatory for exec, and every following value remains a literal AWS argument.
+explicit profile, classifies the command, applies configured target policy,
+and confirms mutating or unknown operations. Account-constrained execution
+also verifies STS identity. Plan and run retain policy-controlled sequences for
+operations that need named approval, fail-fast behavior, and step visibility.
+The -- separator is mandatory for exec, and every following value remains a
+literal AWS argument.
 `
